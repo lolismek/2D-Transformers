@@ -1,0 +1,19 @@
+# Data and model artifacts (regenerable / too large for git — live on kingcrab)
+*.bin
+*.pt
+*.npy
+*.log
+out-*/
+.hfcache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Editor / OS / local tooling
+.DS_Store
+.claude/
+.vscode/
+.idea/
