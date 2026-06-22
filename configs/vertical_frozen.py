@@ -1,10 +1,11 @@
-# Train the vertical (over-layers) transformer on top of a FROZEN pretrained GPT-2 124M.
-# Baseline to beat: vanilla GPT-2 124M val loss on OpenWebText (config/eval_gpt2.py).
+# V1: the vertical (over-layers) transformer on top of a FROZEN pretrained GPT-2 124M.
+# Baseline to beat: vanilla GPT-2 124M val loss on OpenWebText.
 #
-#   python train.py config/train_gpt2_vertical_frozen.py
+# Run from the repo root:
+#   python src/train.py configs/vertical_frozen.py
 
 # I/O
-out_dir = 'out-gpt2-vertical-frozen'
+out_dir = 'runs/vertical_frozen'
 eval_interval = 250
 eval_iters = 200
 log_interval = 10
@@ -15,12 +16,13 @@ wandb_log = False
 wandb_project = '2d-transformer'
 wandb_run_name = 'gpt2-frozen-vertical'
 
-# start from pretrained GPT-2 and freeze the base; train only the vertical transformer
+# start from pretrained GPT-2 and freeze the base; train only the depth-combiner
 init_from = 'gpt2'
 freeze_base = True
 
-# vertical transformer (full bidirectional self-attention over the 13-layer stack, top-layer readout)
-vertical = True
+# architecture: vertical (over-layers) transformer -- full bidirectional self-attention over the
+# 13-layer stack, top-layer readout (see src/arch/vertical.py)
+arch = 'vertical'
 n_vertical_layer = 1
 n_vertical_head = 12
 vertical_mlp_ratio = 2

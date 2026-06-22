@@ -2,21 +2,19 @@
 This training script can be run both on a single gpu in debug mode,
 and also in a larger training run with distributed data parallel (ddp).
 
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
+Run from the repo root, e.g.:
+$ python src/train.py configs/vertical_frozen.py
+$ python src/train.py configs/vertical_frozen.py --batch_size=8 --compile=False
 
 To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
+$ torchrun --standalone --nproc_per_node=4 src/train.py configs/vertical_frozen.py
 
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
+(data is read from ./data/<dataset>/ and checkpoints are written to ./<out_dir>/, both relative
+to the current working directory, so run from the repo root.)
 """
 
 import os
+import sys
 import time
 import math
 import pickle
@@ -27,7 +25,10 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+# make src/ importable regardless of the current working directory
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+from model import GPTConfig, GPT, make_config
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -54,12 +55,12 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
-# vertical (over-layers) transformer
-vertical = False # if True, add a second transformer over the depth (layer) axis
+# depth-combination architecture (see src/arch/)
+arch = 'baseline' # 'baseline' (vanilla top-layer readout) or 'vertical' (over-layers transformer)
 n_vertical_layer = 1
 n_vertical_head = 12
 vertical_mlp_ratio = 2
-freeze_base = False # if True, freeze the base GPT and train only the vertical transformer (+ ln_f)
+freeze_base = False # if True, freeze the base GPT and train only the combiner (+ ln_f)
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -80,7 +81,7 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
+exec(open(os.path.join(_HERE, 'configurator.py')).read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -152,7 +153,7 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
-                  vertical=vertical, n_vertical_layer=n_vertical_layer,
+                  arch=arch, n_vertical_layer=n_vertical_layer,
                   n_vertical_head=n_vertical_head, vertical_mlp_ratio=vertical_mlp_ratio) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -169,14 +170,17 @@ elif init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
+    # tolerate pre-`arch` checkpoints that stored a boolean `vertical` flag instead
+    if 'arch' not in checkpoint_model_args and 'vertical' in checkpoint_model_args:
+        checkpoint_model_args['arch'] = 'vertical' if checkpoint_model_args['vertical'] else 'baseline'
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
-              'vertical', 'n_vertical_layer', 'n_vertical_head', 'vertical_mlp_ratio']:
+              'arch', 'n_vertical_layer', 'n_vertical_head', 'vertical_mlp_ratio']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     # create the model
-    gptconf = GPTConfig(**model_args)
+    gptconf = make_config(model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
@@ -192,13 +196,13 @@ elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
-    if vertical:
-        override_args.update(dict(vertical=vertical, n_vertical_layer=n_vertical_layer,
+    if arch != 'baseline':
+        override_args.update(dict(arch=arch, n_vertical_layer=n_vertical_layer,
                                   n_vertical_head=n_vertical_head, vertical_mlp_ratio=vertical_mlp_ratio))
     model = GPT.from_pretrained(init_from, override_args)
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
-              'vertical', 'n_vertical_layer', 'n_vertical_head', 'vertical_mlp_ratio']:
+              'arch', 'n_vertical_layer', 'n_vertical_head', 'vertical_mlp_ratio']:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
@@ -206,18 +210,19 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
-# optionally freeze the base transformer and train ONLY the vertical (over-layers) transformer
-# (+ the tiny final LayerNorm). configure_optimizers filters by requires_grad, so the optimizer
-# automatically picks up only the trainable params.
+# optionally freeze the base transformer and train ONLY the depth-combiner (+ the tiny final
+# LayerNorm). configure_optimizers filters by requires_grad, so the optimizer automatically picks
+# up only the trainable params.
 if freeze_base:
-    assert model.config.vertical, "freeze_base=True requires vertical=True"
+    assert model.config.arch != 'baseline', "freeze_base=True requires a non-baseline arch"
+    prefix = model.trainable_combiner_prefix   # e.g. 'vertical.'
     n_train, n_frozen = 0, 0
     for pn, p in model.named_parameters():
-        train_this = pn.startswith('vertical.') or pn.startswith('transformer.ln_f.')
+        train_this = (prefix is not None and pn.startswith(prefix)) or pn.startswith('transformer.ln_f.')
         p.requires_grad = train_this
         n_train += p.numel() if train_this else 0
         n_frozen += 0 if train_this else p.numel()
-    print(f"freeze_base: training {n_train/1e6:.2f}M params (vertical + ln_f), froze {n_frozen/1e6:.2f}M")
+    print(f"freeze_base: training {n_train/1e6:.2f}M params (combiner + ln_f), froze {n_frozen/1e6:.2f}M")
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))

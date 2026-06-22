@@ -10,7 +10,12 @@ This validates two things before we ever train:
       transformer at its fresh identity init),
   (2) the stack-collection + vertical wiring in GPT.forward preserves the baseline at init.
 """
+import os
+import sys
 import torch
+
+# make src/ importable regardless of the current working directory
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 from model import GPT
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -20,9 +25,9 @@ print(f"device: {device}")
 print("\n=== loading vanilla GPT-2 (124M) ===")
 m_base = GPT.from_pretrained('gpt2').eval().to(device)
 
-print("\n=== loading 2D GPT-2 (vertical=True, zero-init identity) ===")
+print("\n=== loading 2D GPT-2 (arch='vertical', zero-init identity) ===")
 m_2d = GPT.from_pretrained('gpt2', override_args=dict(
-    vertical=True, n_vertical_layer=1, n_vertical_head=12, vertical_mlp_ratio=2)).eval().to(device)
+    arch='vertical', n_vertical_layer=1, n_vertical_head=12, vertical_mlp_ratio=2)).eval().to(device)
 
 # identical inputs and targets for both models
 B, T = 4, 128

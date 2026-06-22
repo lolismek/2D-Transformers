@@ -4,6 +4,7 @@
 *.npy
 *.log
 out-*/
+runs/
 .hfcache/
 
 # Python

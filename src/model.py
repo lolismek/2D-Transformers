@@ -1,14 +1,27 @@
 """
-Full definition of a GPT Language Model, all of it in this single file.
+Base GPT (nanoGPT-derived) with a PLUGGABLE depth-combination head.
+
+A vanilla transformer combines its per-layer hidden states by the fixed additive residual
+stream and reads out the top layer. This file keeps that base intact but lets an
+"architecture" (see src/arch/) replace *how the per-layer stack is combined into the readout*.
+
+  config.arch = 'baseline'  -> native top-layer readout (bit-for-bit vanilla GPT-2)
+  config.arch = 'vertical'  -> the vertical (over-layers) transformer
+  config.arch = '<new>'     -> add one file in src/arch/ and register it
+
+Shared building blocks (LayerNorm, SelfAttention, MLP, Block) live here so the architecture
+modules can import them. The architecture registry is imported lazily inside GPT.__init__ to
+avoid an import cycle (arch modules import the blocks defined above them in this file).
+
 References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+1) OpenAI GPT-2 TF: https://github.com/openai/gpt-2/blob/master/src/model.py
+2) HuggingFace GPT-2: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+3) karpathy/nanoGPT (vendored pristine under reference/nanogpt)
 """
 
 import math
 import inspect
+import dataclasses
 from dataclasses import dataclass
 
 import torch
@@ -29,8 +42,8 @@ class LayerNorm(nn.Module):
 class SelfAttention(nn.Module):
     """ Multi-head self-attention. Causal by default (the standard GPT block). Set
     is_causal=False for bidirectional attention, as used by the vertical (over-layers)
-    transformer. n_head may be overridden so the vertical transformer can use a different
-    number of heads than the base model. """
+    transformer. n_head may be overridden so an architecture can use a different number of
+    heads than the base model. """
 
     def __init__(self, config, is_causal=True, n_head=None):
         super().__init__()
@@ -121,53 +134,6 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-class VerticalBlock(nn.Module):
-    """ Pre-LN transformer block that attends BIDIRECTIONALLY over the depth (layer) axis.
-    Same structure as Block but with non-causal attention and a configurable MLP ratio. """
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = SelfAttention(config, is_causal=False, n_head=config.n_vertical_head)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config, mlp_ratio=config.vertical_mlp_ratio)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
-
-class VerticalTransformer(nn.Module):
-    """ The second ("vertical") transformer, applied over the depth (layer) axis.
-
-    For each token position the base transformer produces a stack of per-layer hidden states
-    [h_0, h_1, ..., h_L] (S = n_layer + 1 positions; h_0 is the input embedding). This module
-    treats that stack as a sequence, adds a learned depth positional embedding, and attends
-    bidirectionally across the layers with `n_vertical_layer` blocks (shared across all token
-    positions). The readout is the refined TOP-layer position, which feeds ln_f + lm_head in
-    place of the usual top-layer hidden state.
-
-    Init-parity: depth_pos_emb is zero-init and each block's residual output projections are
-    zero-init (see GPT.__init__), so at initialization this module is the exact identity on the
-    stack and returns h_L unchanged -> the full model matches vanilla GPT bit-for-bit until the
-    vertical weights start to move during training. """
-
-    def __init__(self, config):
-        super().__init__()
-        self.n_stack = config.n_layer + 1                       # S = number of depth positions
-        self.depth_pos_emb = nn.Parameter(torch.zeros(self.n_stack, config.n_embd))
-        self.blocks = nn.ModuleList([VerticalBlock(config) for _ in range(config.n_vertical_layer)])
-
-    def forward(self, H):
-        # H: (B, T, S, d) stack of per-layer hidden states
-        B, T, S, d = H.size()
-        z = H + self.depth_pos_emb                              # (S, d) broadcasts over (B, T, S, d)
-        z = z.view(B * T, S, d)                                 # each (token) is its own depth-sequence
-        for block in self.blocks:
-            z = block(z)
-        z = z.view(B, T, S, d)
-        return z[:, :, -1, :]                                   # readout = refined top-layer (h_L)
-
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -177,11 +143,27 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    # --- vertical (over-layers) transformer ---
-    vertical: bool = False        # if True, add the second transformer over the depth axis
+    # --- depth-combination architecture (see src/arch/) ---
+    arch: str = 'baseline'        # which depth-combiner to use: 'baseline' | 'vertical' | ...
+    # vertical (over-layers) transformer hyperparameters (used when arch == 'vertical')
     n_vertical_layer: int = 1     # number of bidirectional blocks in the vertical transformer
     n_vertical_head: int = 12     # attention heads in the vertical transformer
     vertical_mlp_ratio: int = 2   # MLP expansion inside vertical blocks (small: runs per depth-token)
+
+
+def make_config(model_args: dict) -> GPTConfig:
+    """Build a GPTConfig from a (possibly legacy) model_args dict.
+
+    Tolerates checkpoints saved before the `arch` field existed, which stored a boolean
+    `vertical` flag instead, and drops any keys GPTConfig no longer knows about. Use this
+    (rather than GPTConfig(**model_args)) whenever building a config from a checkpoint."""
+    a = dict(model_args)
+    if 'arch' not in a and 'vertical' in a:
+        a['arch'] = 'vertical' if a.get('vertical') else 'baseline'
+    a.pop('vertical', None)
+    known = {f.name for f in dataclasses.fields(GPTConfig)}
+    return GPTConfig(**{k: v for k, v in a.items() if k in known})
+
 
 class GPT(nn.Module):
 
@@ -205,11 +187,22 @@ class GPT(nn.Module):
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-        # the second transformer over the depth (layer) axis. Kept as a sibling of
-        # self.transformer so its params stay out of the GPT-2 state_dict namespace (this keeps
-        # from_pretrained's key-matching against HuggingFace GPT-2 clean).
-        if config.vertical:
-            self.vertical = VerticalTransformer(config)
+        # the depth-combination head for the chosen architecture. Imported lazily to avoid an
+        # import cycle (arch modules import the blocks defined above). The combiner is registered
+        # under its own STATE_KEY (e.g. 'vertical') so its checkpoint keys live in their own
+        # namespace -- this keeps from_pretrained's key-matching against HuggingFace GPT-2 clean
+        # AND keeps checkpoints stable across architectures.
+        from arch import build_combiner
+        combiner = build_combiner(config)
+        if getattr(combiner, 'STATE_KEY', None) is not None:
+            setattr(self, combiner.STATE_KEY, combiner)        # registers params under e.g. 'vertical.'
+            self._combiner_key = combiner.STATE_KEY
+            self.trainable_combiner_prefix = combiner.STATE_KEY + '.'
+        else:
+            # parameter-less combiner (baseline): store it but it adds no state_dict keys
+            self._combiner = combiner
+            self._combiner_key = '_combiner'
+            self.trainable_combiner_prefix = None
 
         # init all weights
         self.apply(self._init_weights)
@@ -217,20 +210,19 @@ class GPT(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-        # zero-init the vertical transformer's residual output projections so that, together with
-        # the zero-init depth positional embedding, it is the exact identity at initialization
-        # (the full model then matches vanilla GPT-2 bit-for-bit until the vertical weights move).
-        if config.vertical:
-            for block in self.vertical.blocks:
-                torch.nn.init.zeros_(block.attn.c_proj.weight)
-                torch.nn.init.zeros_(block.mlp.c_proj.weight)
-                if block.attn.c_proj.bias is not None:
-                    torch.nn.init.zeros_(block.attn.c_proj.bias)
-                if block.mlp.c_proj.bias is not None:
-                    torch.nn.init.zeros_(block.mlp.c_proj.bias)
+        # let the architecture re-init itself to an identity if it supports it (e.g. the vertical
+        # transformer zeroes its residual projections + depth pos-emb so the full model matches
+        # vanilla GPT-2 bit-for-bit at init and can only improve during training).
+        if hasattr(self.combiner, 'init_identity'):
+            self.combiner.init_identity()
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    @property
+    def combiner(self):
+        """The depth-combination head (an nn.Module). For 'baseline' it is parameter-less."""
+        return getattr(self, self._combiner_key)
 
     def get_num_params(self, non_embedding=True):
         """
@@ -262,16 +254,17 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        if self.config.vertical:
-            # collect the per-layer stack [h_0, h_1, ..., h_L] and let the vertical transformer
-            # combine across the depth axis, in place of simply "take the top layer".
+        if getattr(self.combiner, 'needs_stack', False):
+            # collect the per-layer stack [h_0, h_1, ..., h_L] and let the architecture combine
+            # across the depth axis, in place of simply "take the top layer".
             hs = [x]
             for block in self.transformer.h:
                 x = block(x)
                 hs.append(x)
             H = torch.stack(hs, dim=2)            # (b, t, n_layer+1, n_embd)
-            x = self.vertical(H)                  # (b, t, n_embd) refined top-layer readout
+            x = self.combiner(H)                  # (b, t, n_embd) refined readout
         else:
+            # baseline: native residual stream, read out the top layer (bit-for-bit vanilla GPT-2)
             for block in self.transformer.h:
                 x = block(x)
         x = self.transformer.ln_f(x)
@@ -302,8 +295,8 @@ class GPT(nn.Module):
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
-        # dropout and the vertical (over-layers) transformer settings may be overridden
-        allowed = {'dropout', 'vertical', 'n_vertical_layer', 'n_vertical_head', 'vertical_mlp_ratio'}
+        # dropout and the depth-combination architecture settings may be overridden
+        allowed = {'dropout', 'arch', 'n_vertical_layer', 'n_vertical_head', 'vertical_mlp_ratio'}
         assert all(k in allowed for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
@@ -319,7 +312,7 @@ class GPT(nn.Module):
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
-        # apply any overrides (dropout, and the vertical-transformer settings)
+        # apply any overrides (dropout, and the architecture settings)
         for k, v in override_args.items():
             print(f"overriding {k} = {v}")
             config_args[k] = v
@@ -328,9 +321,10 @@ class GPT(nn.Module):
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
-        # discard the causal-mask buffer (not a param); also exclude the vertical transformer's own
-        # params -- GPT-2 has no such weights, so they stay at their fresh (identity) initialization
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias') and not k.startswith('vertical.')]
+        # keep only the BASE model's params (transformer.* and the tied lm_head); the architecture
+        # combiner's own params (e.g. vertical.*) have no GPT-2 counterpart, so they stay at their
+        # fresh (identity) init. Also drop the causal-mask buffer (not a param).
+        sd_keys = [k for k in sd_keys if k.startswith(('transformer.', 'lm_head.')) and not k.endswith('.attn.bias')]
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)

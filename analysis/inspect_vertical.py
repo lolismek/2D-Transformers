@@ -6,24 +6,28 @@ Inspect the trained vertical (over-layers) transformer:
      test: a non-degenerate spread => genuine cross-depth combination; a near one-hot on the top
      layer => the vertical transformer collapsed onto the baseline and the gain was just params.
 
-Run on kingcrab in the 2dtf env from ~/2d-Transformers/nanogpt:
-    ~/miniforge3/envs/2dtf/bin/python inspect_vertical.py
+Run from the repo root (kingcrab, 2dtf env):
+    ~/miniforge3/envs/2dtf/bin/python analysis/inspect_vertical.py
 """
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn.functional as F
 import tiktoken
-from model import GPTConfig, GPT
+
+# make src/ importable regardless of the current working directory
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
+from model import GPTConfig, GPT, make_config
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-ckpt_path = 'out-gpt2-vertical-frozen/ckpt.pt'
+ckpt_path = 'runs/vertical_frozen/ckpt.pt'
 data_dir = 'data/openwebtext'
 torch.manual_seed(1337)
 
 # ---------------------------------------------------------------- load model
 ckpt = torch.load(ckpt_path, map_location=device)
-conf = GPTConfig(**ckpt['model_args'])
+conf = make_config(ckpt['model_args'])
 model = GPT(conf)
 sd = ckpt['model']
 for k in list(sd.keys()):                       # strip a torch.compile prefix if present
