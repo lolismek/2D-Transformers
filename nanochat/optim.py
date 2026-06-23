@@ -8,9 +8,19 @@ Further contributions from @karpathy and @chrisjmccormick.
 """
 
 import torch
+import torch._dynamo
 import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
+
+# The fused Muon/AdamW steps below are torch.compiled with dynamic=False, so each distinct
+# parameter shape-bucket compiles separately. A model with a depth-reader (nanochat/readers/)
+# adds extra matrix shapes (down/up-proj + reader blocks), which can exceed torch._dynamo's
+# default recompile limit of 8. Raise it so every bucket compiles. This is bounded: dynamic=False
+# means exactly one compile per shape, so there is no runaway recompilation.
+torch._dynamo.config.recompile_limit = max(getattr(torch._dynamo.config, "recompile_limit", 8), 64)
+if hasattr(torch._dynamo.config, "cache_size_limit"):
+    torch._dynamo.config.cache_size_limit = max(getattr(torch._dynamo.config, "cache_size_limit", 8), 64)
 
 # -----------------------------------------------------------------------------
 """
