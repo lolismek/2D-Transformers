@@ -5,6 +5,9 @@ dev-ignore/
 report.md
 eval_bundle/
 
+# macOS
+.DS_Store
+
 # Secrets
 .env
 
