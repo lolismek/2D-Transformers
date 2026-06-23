@@ -13,24 +13,40 @@ it. nanochat is otherwise unmodified except for **three small, gated edits** (li
 `--reader=none` the training path is byte-identical to stock nanochat, so the baseline is a faithful
 control.
 
-## Result so far — depth-10 backbone (`d=640`, 10 layers, 5 heads)
+## Result — depth-10 backbone (`d=640`, 10 layers, 5 heads)
 
 The **"10+2"** setup: a stock nanochat depth-10 backbone **H** produces the 11-rung residual ladder
 `[x0, h_1, …, h_10]`; a 2-layer bidirectional **reader V** over those rungs produces the readout —
-no `h_10` skip, no gate, no identity init, so V has to *earn* its keep.
+no `h_10` skip, no gate, no identity init, so V has to *earn* its keep. We test the full-width
+reader (`d_V = 640`, no bottleneck) on two clean axes.
 
-| readout | val bpb | training compute | Δ vs baseline |
+**Equal data** — same 841M tokens, same 1605-step schedule (the *per-token / capability* question):
+
+| readout | val bpb | Δ vs baseline |
+|---|---|---|
+| **baseline** — stock top-state `h_10` | **0.877** | — |
+| reader `d_V=128` (bottlenecked) | 0.933 | +0.056 |
+| **WideReader `d_V=640`** (full width) | 0.898 | **+0.021** |
+
+**Equal compute** — same 1.03e18 fwd+bwd FLOPs; the reader costs **2.12×/token**, so for the same
+compute the baseline trains 3406 steps / 2× the tokens (the *per-FLOP / is-it-worth-it* question):
+
+| readout | val bpb | steps · tokens | Δ vs baseline |
 |---|---|---|---|
-| **baseline** — stock top-state `h_10` | **0.877** | 1.00× | — |
-| reader `d_V=128` (bottlenecked) | 0.933 | 1.06× | +0.056 |
-| reader `d_V=640` (full width, iso-FLOP) | 0.928 | 1.00× | +0.051 |
+| **baseline** — top-state `h_10` | **0.845** | 3406 · 1.79B | — |
+| **WideReader `d_V=640`** | 0.898 | 1605 · 841M | **+0.053** |
 
-**Verdict: depth-reading-as-readout does not beat plain top-state reading at equal compute, and
-widening the reader to full width (removing the 128-dim bottleneck) does not rescue it** — so the
-bottleneck was not the cause. Full writeup, probes, and figures:
+**Verdict: depth-reading-as-readout does not beat plain top-state reading.** At equal *data* the
+full-width reader is only modestly behind (**+0.021**) — removing the 128-dim bottleneck and training
+to the full budget closed most of the original gap, so the reader's readout is nearly as good per
+token. But it never wins, and at equal *compute* it loses by more (**+0.053**): the reader's 2.12×
+overhead is better spent training the baseline on 2× more tokens, and data scales well here
+(0.877 → 0.845). The depth ladder carries little that the top state `h_10` doesn't already expose.
+Full writeup, probes, and figures:
 [`experiments/nanochat_10p2_reader.md`](experiments/nanochat_10p2_reader.md).
 
-![iso-FLOP comparison](experiments/figs/wide640_isoflop.png)
+![equal-compute: WideReader vs compute-matched baseline](experiments/figs/flops_compare.png)
+![equal-data: WideReader vs baseline at 841M tokens](experiments/figs/tokens_compare.png)
 
 ## Repository layout
 
@@ -60,13 +76,14 @@ line and needs no other backbone changes.
 | script | purpose |
 |---|---|
 | `run_phase_a.sh` | train d10 baseline vs `d_V=128` reader at the full budget |
-| `run_wide640.sh` | train the `d_V=640` WideReader at iso-total-FLOP (756 steps) |
+| `run_wide640.sh` | train the `d_V=640` WideReader (iso-FLOP 756 steps, or full 1605-step budget via `STEPS=1605`) |
+| `run_baseline_long.sh` | train the compute-matched baseline (3406 steps) for the equal-compute comparison |
 | `setup_data.sh` | download data shards + train the tokenizer |
 | `inspect_reader.py` | depth-attention diagnostic (per-rung query-pool weights) |
 | `svd_readout_probe.py` | PCA-truncation rank probe of the baseline readout |
 | `frozen_probe.py` | trained 128-dim linear cap on the *frozen* baseline readout |
 | `check_reader.py` · `check_reader_dist.py` · `check_wide_reader.py` | data-free integration / distributed / shape checks |
-| `plot_phase_a.py` · `plot_wide_compare.py` | figures |
+| `plot_phase_a.py` · `plot_wide_compare.py` · `plot_compute_data.py` | figures |
 
 ## Setup & reproduce
 
