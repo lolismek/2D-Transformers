@@ -20,7 +20,7 @@ run() {
   echo "===================================================================="
   echo "===== $(date) START reader=$R tag=$TAG ====="
   echo "===================================================================="
-  torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- $COMMON --reader="$R" --model-tag="$TAG"
+  uv run torchrun --standalone --nproc_per_node=$NPROC -m scripts.base_train -- $COMMON --reader="$R" --model-tag="$TAG"
   echo "===== $(date) END reader=$R tag=$TAG ====="
 }
 
