@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+dev-ignore/
+report.md
+eval_bundle/
+
+# Secrets
+.env
+
+# Local setup
+CLAUDE.md
+wandb/
+
+# stale v0 experiment output (kept locally, not vendored)
+runs/vertical_frozen/
