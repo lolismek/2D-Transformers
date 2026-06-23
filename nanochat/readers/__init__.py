@@ -7,9 +7,11 @@ registering it here. `build_reader(config)` returns None for config.reader == "n
 
 from nanochat.readers.base import BaseReader
 from nanochat.readers.vertical import VerticalReader
+from nanochat.readers.wide import WideReader
 
 REGISTRY = {
     "vertical": VerticalReader,
+    "wide": WideReader,
 }
 
 

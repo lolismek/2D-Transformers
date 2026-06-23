@@ -5,9 +5,9 @@ architecture) beat reading only the top-layer state, at near-zero added cost? Ph
 This log records Phase A and the follow-up probes asking whether the reader's **128-dim
 bottleneck** is the cause.
 
-Related code: `nanochat/readers/vertical.py` (the reader), `scripts/inspect_reader.py`
-(depth-attention diagnostic), `scripts/svd_readout_probe.py` (PCA truncation),
-`scripts/frozen_probe.py` (trained 128-dim cap).
+Related code: `nanochat/readers/vertical.py` (the `d_V=128` reader), `nanochat/readers/wide.py`
+(the full-width `d_V=640` reader), `scripts/inspect_reader.py` (depth-attention diagnostic),
+`scripts/svd_readout_probe.py` (PCA truncation), `scripts/frozen_probe.py` (trained 128-dim cap).
 
 ## Setup
 
@@ -94,9 +94,42 @@ single-variable (the subspace objective) and recovers 0.29 bpb — confirming va
   ladder-reading + nonlinearity buy back ~0.11 over a plain 128-cap. So the reader is *not* simply
   bottleneck-limited, and the probe **cannot pin** the residual 0.056 to *width* vs the *readout
   mechanism*.
-- **Decisive next test: the `d_V=640` retrain** (remove the cap entirely; ~1.5 hr, per-step cost
-  grows ~quadratically in `d_V` while the token budget stays fixed). Optional midpoint `d_V=320`
-  for monotonicity.
+- **Decisive next test: the `d_V=640` retrain** (remove the cap entirely) — **done; see the next
+  section.** Verdict: removing the bottleneck did *not* recover the deficit.
+
+## d_V=640 WideReader — the decisive iso-FLOP test (`nanochat/readers/wide.py`)
+
+Remove the 128-dim cap entirely and ask the bottleneck question at **equal total compute**. New
+module `WideReader` (the old `VerticalReader` is untouched — every experiment kept): reads the ladder
+at **native width 640**, 2 bidirectional depth-blocks, **5 heads / head_dim 128 (= H exactly)**,
+learned query-pool, owns the readout. At `d_V = n_embd` the Phase-A `down`/`up` projections are
+redundant (down is absorbable into block-0's input projections; up into the shared final-norm +
+lm_head), so **both are dropped**. **9,838,080 params.**
+
+The depth-blocks now run at `640²` over all 11 rungs → true fwd+bwd cost **648.8M FLOPs/token** on
+top of the baseline's 578M = **2.122×/token**. To hold *total* training FLOPs = baseline, cut the
+budget: `1605 / 2.122 ≈ 756 steps` (`--num-iterations 756`). `estimate_flops()` undercounts the
+reader ~11× (blind to the rung axis), so the budget is set by hand, not via `--target-flops`.
+`--device-batch-size=16` (the full-width `(B*T,11,640)` activations are ~11× an H layer's and OOM at
+the default); grad-accum auto-grows 4→8 to hold the effective batch, so it is math-equivalent. The
+catch baked into iso-FLOP: the wide run sees **~47% of the tokens** (~395M vs 841M).
+
+| model | val bpb | steps | total FLOPs | tokens |
+|---|---|---|---|---|
+| baseline (top-state readout) | **0.877** | 1605 | 1.00 F | 841M |
+| reader `d_V=128` (Phase A) | 0.933 | 1605 | 1.06 F | 841M |
+| **WideReader `d_V=640`, iso-FLOP** | **0.928** | 756 | 1.00 F | ~395M |
+
+**Verdict: widening did not rescue the reader.** Full width, H-matched heads, no bottleneck, no
+down/up — and at equal compute it still loses to plain baseline by **+0.051** (0.928 vs 0.877).
+Removing the 128-dim cap closed only ~0.005 of the original 0.056 gap, so the **bottleneck is largely
+exonerated**: the depth-reading-as-readout approach is itself the weaker bet at d10, not the width.
+(Secondary, weak: WideReader edged the bottlenecked reader 0.928 vs 0.933 *despite half the tokens* —
+a faint hint that removing the cap helps per-token efficiency, nowhere near enough to matter.)
+Caveat: iso-FLOP bundles the ~47% token cut; the cleaner "width at *fixed tokens*" run
+(`d_V=640 × 1605 steps`, ~2.1× compute) was not done — but moot, since the reader is not worth its
+compute at equal budget regardless. Plot `experiments/figs/wide640_isoflop.png` (val bpb vs
+cumulative compute); data `experiments/figs/wide640_val.csv`.
 
 ## Reproduce
 
@@ -106,8 +139,11 @@ cd ~/2d-Transformers-nc
 CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m scripts.svd_readout_probe --model-tag d10_baseline
 CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m scripts.frozen_probe     --model-tag d10_baseline
 
-# depth-attention diagnostic on the reader checkpoint
+# depth-attention diagnostic on a reader checkpoint
 CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m scripts.inspect_reader --model-tag d10_reader
+
+# d_V=640 WideReader, iso-total-FLOP (756 steps), GPUs 2,3
+CUDA_VISIBLE_DEVICES=2,3 NPROC=2 nohup bash scripts/run_wide640.sh > wide640.log 2>&1 &
 ```
 
-Checkpoints (tigerfish): `~/.cache/nanochat/base_checkpoints/d10_{baseline,reader}/model_001605.pt`.
+Checkpoints (tigerfish): `~/.cache/nanochat/base_checkpoints/d10_{baseline,reader,wide640}/`.
