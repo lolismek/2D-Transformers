@@ -383,8 +383,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
         param_infos = {}
         for p in group['params']:
             grad = p.grad
-            if p.numel() < 1024:
-                # Small params: all_reduce (no scatter/gather needed)
+            if p.numel() < 1024 or grad.shape[0] % world_size != 0:
+                # all_reduce (no scatter/gather): small params, or params whose leading dim isn't
+                # divisible by world_size (e.g. the reader's (n_rungs, dV) depth-pos embeds with
+                # n_rungs=11) -- the reduce_scatter branch below would assert on those.
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
             else:

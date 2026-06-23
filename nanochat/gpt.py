@@ -398,11 +398,20 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
+        # In reader mode the reader owns the readout, so the backbone's backout subtraction is
+        # bypassed and backout_lambda never receives a gradient. Leaving it in an AdamW group makes
+        # the distributed grad all-reduce choke on its None grad at world_size>1 (single-GPU
+        # MuonAdamW tolerates None grads, which is why check_reader.py missed it). Drop it from the
+        # optimizer in reader mode; it stays frozen at init (unused). Baseline (reader=None) unchanged.
+        unoptimized_params = []
+        if self.reader is not None:
+            smear_params = [self.smear_gate.weight, self.smear_lambda]
+            unoptimized_params = [self.backout_lambda]
         # Pluggable reader params: 2D matrices -> Muon (folded into matrix_params), depth-pos/query -> AdamW
         reader_matrix_params = self.reader.matrix_parameters() if self.reader is not None else []
         reader_adamw_params = self.reader.adamw_parameters() if self.reader is not None else []
         matrix_params = matrix_params + reader_matrix_params
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(reader_adamw_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(reader_adamw_params) + len(unoptimized_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
