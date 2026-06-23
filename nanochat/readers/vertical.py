@@ -20,6 +20,12 @@ import torch.nn.functional as F
 from nanochat.gpt import Linear, norm
 from nanochat.readers.base import BaseReader
 
+# CUDA caps grid dimensions at 65535. SDPA folds the (B*T) batch onto a grid axis, so the
+# reader's depth-attention must tile that batch to keep every kernel launch under the cap
+# (B*T = 32*2048 = 65536 at the d10 default trips "invalid configuration argument").
+# 8192 stays safe for reader_heads up to 8; the rung count S is tiny, so extra launches are free.
+_SDPA_BATCH_CHUNK = 8192
+
 
 class VBlock(nn.Module):
     """Pre-norm bidirectional transformer block over the rung axis, width dV."""
@@ -37,13 +43,24 @@ class VBlock(nn.Module):
         self.mlp_proj = Linear(mlp_mult * dim, dim, bias=False)
 
     def _attn(self, z):
-        N, S, D = z.shape
-        q = self.c_q(z).view(N, S, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(z).view(N, S, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(z).view(N, S, self.n_heads, self.head_dim).transpose(1, 2)
-        # Bidirectional (non-causal) attention over the N rungs. N is tiny (=n_layer+1).
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        y = y.transpose(1, 2).contiguous().view(N, S, D)
+        M, S, D = z.shape  # M = folded batch (B*T), S = rungs (=n_layer+1), D = dim
+        q = self.c_q(z).view(M, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(z).view(M, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(z).view(M, S, self.n_heads, self.head_dim).transpose(1, 2)
+        # Bidirectional (non-causal) attention over the S rungs (tiny: S = n_layer+1). SDPA
+        # maps the folded batch M = B*T onto a CUDA grid axis capped at 65535, so a single
+        # launch with M > 65535 dies ("invalid configuration argument"). Tile M under the cap;
+        # attention is independent per batch row, so chunking is exactly equivalent.
+        if M <= _SDPA_BATCH_CHUNK:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        else:
+            y = torch.cat([
+                F.scaled_dot_product_attention(
+                    q[i:i + _SDPA_BATCH_CHUNK], k[i:i + _SDPA_BATCH_CHUNK],
+                    v[i:i + _SDPA_BATCH_CHUNK], is_causal=False)
+                for i in range(0, M, _SDPA_BATCH_CHUNK)
+            ], dim=0)
+        y = y.transpose(1, 2).contiguous().view(M, S, D)
         return self.c_proj(y)
 
     def _mlp(self, z):
