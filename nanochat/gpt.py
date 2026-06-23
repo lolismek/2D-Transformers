@@ -37,6 +37,12 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Depth-reader ("vertical" architecture) that owns the readout. "none" = stock top-state readout.
+    reader: str = "none"
+    reader_dim: int = 128      # dV: reader bottleneck width
+    reader_layers: int = 2     # number of bidirectional blocks over the depth axis
+    reader_heads: int = 2      # reader attention heads (head_dim = reader_dim // reader_heads)
+    reader_mlp_mult: int = 4   # reader MLP hidden = reader_mlp_mult * reader_dim
 
 
 def norm(x):
@@ -188,6 +194,9 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # Pluggable depth-reader (see nanochat/readers/). None => stock top-state readout (baseline).
+        from nanochat.readers import build_reader  # local import to avoid a circular import at module load
+        self.reader = build_reader(config)
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -264,6 +273,10 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
+
+        # Initialize the pluggable reader, if any (its own init; deliberately NOT identity-initialized)
+        if self.reader is not None:
+            self.reader.init_weights()
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -360,7 +373,8 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        reader = sum(p.numel() for p in self.reader.parameters()) if self.reader is not None else 0
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + reader
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -368,6 +382,7 @@ class GPT(nn.Module):
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
+            'reader': reader,
             'total': total,
         }
 
@@ -383,7 +398,11 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        # Pluggable reader params: 2D matrices -> Muon (folded into matrix_params), depth-pos/query -> AdamW
+        reader_matrix_params = self.reader.matrix_parameters() if self.reader is not None else []
+        reader_adamw_params = self.reader.adamw_parameters() if self.reader is not None else []
+        matrix_params = matrix_params + reader_matrix_params
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(reader_adamw_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -399,6 +418,9 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # AdamW group for the reader's embedding-like params (depth pos embeds + query vector)
+        if reader_adamw_params:
+            param_groups.append(dict(kind='adamw', params=reader_adamw_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -453,16 +475,24 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # If a depth-reader is active, stash the per-block residual ladder [x0, h_1..h_L].
+        ladder = [x0] if (self.reader is not None and self.reader.needs_ladder) else None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
-        # Subtract mid-layer residual to remove low-level features before logit projection
-        if x_backout is not None:
-            x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+            if ladder is not None:
+                ladder.append(x)
+        # Readout: the reader (if any) owns it, reading the whole ladder in place of just h_L.
+        if ladder is not None:
+            x = self.reader.readout(ladder)
+        else:
+            # Subtract mid-layer residual to remove low-level features before logit projection
+            if x_backout is not None:
+                x = x - self.backout_lambda.to(x.dtype) * x_backout
+        x = norm(x)  # shared final norm for both readout paths
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]

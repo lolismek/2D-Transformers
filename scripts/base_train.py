@@ -52,6 +52,12 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+# Depth-reader ("vertical" architecture); "none" = stock top-state readout (baseline)
+parser.add_argument("--reader", type=str, default="none", help="depth-reader architecture: none|vertical")
+parser.add_argument("--reader-dim", type=int, default=128, help="reader bottleneck width dV")
+parser.add_argument("--reader-layers", type=int, default=2, help="number of bidirectional reader blocks over depth")
+parser.add_argument("--reader-heads", type=int, default=2, help="reader attention heads (head_dim = reader_dim // reader_heads)")
+parser.add_argument("--reader-mlp-mult", type=int, default=4, help="reader MLP hidden multiplier")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,6 +143,8 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        reader=args.reader, reader_dim=args.reader_dim, reader_layers=args.reader_layers,
+        reader_heads=args.reader_heads, reader_mlp_mult=args.reader_mlp_mult,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
