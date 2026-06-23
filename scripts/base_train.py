@@ -58,6 +58,7 @@ parser.add_argument("--reader-dim", type=int, default=128, help="reader bottlene
 parser.add_argument("--reader-layers", type=int, default=2, help="number of bidirectional reader blocks over depth")
 parser.add_argument("--reader-heads", type=int, default=2, help="reader attention heads (head_dim = reader_dim // reader_heads)")
 parser.add_argument("--reader-mlp-mult", type=int, default=4, help="reader MLP hidden multiplier")
+parser.add_argument("--h-residual", type=str, default="full", choices=["full", "none"], help="H trunk residuals: full=stock nanochat (baseline); none=residual-free (drop attn+mlp skips and the x0 injection)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -145,6 +146,7 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         reader=args.reader, reader_dim=args.reader_dim, reader_layers=args.reader_layers,
         reader_heads=args.reader_heads, reader_mlp_mult=args.reader_mlp_mult,
+        h_residual=args.h_residual,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

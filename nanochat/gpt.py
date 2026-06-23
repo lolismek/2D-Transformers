@@ -43,6 +43,12 @@ class GPTConfig:
     reader_layers: int = 2     # number of bidirectional blocks over the depth axis
     reader_heads: int = 2      # reader attention heads (head_dim = reader_dim // reader_heads)
     reader_mlp_mult: int = 4   # reader MLP hidden = reader_mlp_mult * reader_dim
+    # H-backbone residual mode. "full" = stock nanochat (baseline byte-identical).
+    # "none" = residual-free trunk: drop both in-block skips (attn, mlp) AND the per-layer x0
+    # injection, so each depth rung is a pure transform of the previous one rather than a partial
+    # sum of one telescoping series. Tests whether the residual stream's free additive depth-
+    # aggregation is what makes the depth-reader redundant. See nanochat/h_variants.py.
+    h_residual: str = "full"
 
 
 def norm(x):
@@ -174,9 +180,14 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        # Stock Block (with skip connections) unless the trunk is configured residual-free.
+        block_cls = Block
+        if getattr(config, "h_residual", "full") == "none":
+            from nanochat.h_variants import ResidualFreeBlock  # local import avoids a circular import
+            block_cls = ResidualFreeBlock
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
+            "h": nn.ModuleList([block_cls(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -230,13 +241,25 @@ class GPT(nn.Module):
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        # In residual-free mode there is no skip to carry the signal, so the output projections must
+        # NOT be zero-initialized (the stock residual trick): zeros would make every block emit
+        # exactly 0 at init (and relu^2'(0)=0), so the whole trunk outputs 0 and no gradient flows.
+        # Init them at fan-in scale instead so the residual-free trunk is alive at step 0.
+        residual_free = getattr(self.config, "h_residual", "full") == "none"
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            if residual_free:
+                torch.nn.init.uniform_(block.attn.c_proj.weight, -s, s)             # fan-in n_embd
+                torch.nn.init.uniform_(block.mlp.c_proj.weight, -s * 0.5, s * 0.5)  # fan-in 4*n_embd
+            else:
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero (skip carries signal)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+        if residual_free:
+            print0("[H] residual-free trunk: dropped attn+mlp skips and x0 injection; "
+                   "c_proj initialized at fan-in scale (not zeros) so the trunk is alive at init")
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -407,6 +430,13 @@ class GPT(nn.Module):
         if self.reader is not None:
             smear_params = [self.smear_gate.weight, self.smear_lambda]
             unoptimized_params = [self.backout_lambda]
+        # In residual-free mode (h_residual="none") the x0 injection is removed from forward, so
+        # x0_lambdas never receives a gradient -- the same distributed None-grad problem as backout
+        # above (DistMuonAdamW's all-reduce rejects a None grad at world_size>1). Drop it from the
+        # optimizer too; it stays frozen at init (unused).
+        if getattr(self.config, "h_residual", "full") == "none":
+            unoptimized_params = unoptimized_params + [self.x0_lambdas]
+            x0_params = []
         # Pluggable reader params: 2D matrices -> Muon (folded into matrix_params), depth-pos/query -> AdamW
         reader_matrix_params = self.reader.matrix_parameters() if self.reader is not None else []
         reader_adamw_params = self.reader.adamw_parameters() if self.reader is not None else []
@@ -424,9 +454,12 @@ class GPT(nn.Module):
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        # x0_lambdas AdamW group -- omitted in residual-free mode, where x0_params is empty (the x0
+        # injection is off, so x0_lambdas is unused and excluded above to avoid a None-grad reduce).
+        if x0_params:
+            param_groups.append(dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))  # higher beta1 for x0
         # AdamW group for the reader's embedding-like params (depth pos embeds + query vector)
         if reader_adamw_params:
             param_groups.append(dict(kind='adamw', params=reader_adamw_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
@@ -484,10 +517,14 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        residual_free = getattr(self.config, "h_residual", "full") == "none"
         # If a depth-reader is active, stash the per-block residual ladder [x0, h_1..h_L].
         ladder = [x0] if (self.reader is not None and self.reader.needs_ladder) else None
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            if residual_free:
+                x = self.resid_lambdas[i] * x  # keep the learned per-layer gain, drop the x0 injection
+            else:
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
@@ -498,8 +535,10 @@ class GPT(nn.Module):
         if ladder is not None:
             x = self.reader.readout(ladder)
         else:
-            # Subtract mid-layer residual to remove low-level features before logit projection
-            if x_backout is not None:
+            # Subtract mid-layer residual to remove low-level features before logit projection.
+            # Skipped when residual-free: backout assumes the partial-sum structure (x_backout is a
+            # mid-layer partial sum), which no longer holds once the skips are gone.
+            if x_backout is not None and not residual_free:
                 x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)  # shared final norm for both readout paths
 
