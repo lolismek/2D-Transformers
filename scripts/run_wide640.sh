@@ -24,6 +24,8 @@ export OMP_NUM_THREADS=1
 NPROC=${NPROC:-2}
 STEPS=${STEPS:-756}
 TAG=${TAG:-d10_wide640}
+LAYERS=${LAYERS:-2}   # number of bidirectional reader blocks over the depth axis (V's height).
+                      # LAYERS=2 is the original WideReader; bump for the taller-V capacity sweep.
 DBS=${DBS:-16}   # device microbatch; smaller than baseline's 32 because the full-width reader's
                  # (B*T, 11, 640) activations are ~11x an H layer's. grad-accum auto-grows to hold
                  # --total-batch-size fixed => same effective batch + same 756-step budget, just
@@ -33,7 +35,7 @@ DBS=${DBS:-16}   # device microbatch; smaller than baseline's 32 because the ful
 # n_head), the step budget, and the memory-driven microbatch size differ. --reader-dim=640 is passed
 # only so the logged/checkpoint config is honest (WideReader ignores it and uses n_embd).
 COMMON="--depth=10 --window-pattern=L --eval-every=100 --eval-tokens=2097152 --core-metric-every=-1 --sample-every=-1"
-WIDE="--reader=wide --reader-dim=640 --num-iterations=$STEPS --device-batch-size=$DBS"
+WIDE="--reader=wide --reader-dim=640 --reader-layers=$LAYERS --num-iterations=$STEPS --device-batch-size=$DBS"
 
 echo "===================================================================="
 echo "===== $(date) START reader=wide tag=$TAG steps=$STEPS (iso-FLOP) ====="

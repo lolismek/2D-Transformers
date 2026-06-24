@@ -1,19 +1,29 @@
-"""Modal launcher for the residual-free WideReader run (and pilots) on 2x A100-40GB.
+"""Modal launcher for WideReader runs on N x A100-40GB (serverless).
 
 Reproduces the tigerfish setup EXACTLY so val bpb overlays the existing baseline@1605=0.877 and
-wide@1605=0.898 -- only --h-residual=none differs:
+wide@1605=0.898 -- only the swept knob differs (--h-residual or --reader-layers):
   * same data:      nanochat.dataset -n 24  => train shards 0..23 + val shard 6542  (hash-verified)
   * same tokenizer: tigerfish's tokenizer.pkl + token_bytes.pt in the Volume        (hash-verified)
-  * same numerics:  A100(40GB) x2, bf16, --window-pattern=L (no FA3), DBS=16, seed/schedule unchanged
-  * same code:      this repo (mounted), incl. the residual-free edits + nanochat/h_variants.py
+  * same numerics:  A100(40GB), bf16, --window-pattern=L (no FA3), DBS=16, total-batch auto (524288),
+                    seed/schedule unchanged. total-batch-size is keyed on depth (reader excluded from
+                    the scaling count), so world_size 2 vs 4 give the SAME effective batch => DDP at
+                    nproc=4 is a pure ~2x wall-clock speedup, directly comparable to the 2-GPU runs.
+  * same code:      this repo (mounted), incl. nanochat/readers/wide.py + nanochat/h_variants.py
+
+GPU count is set at launch via the MODAL_GPUS env var (decorator is evaluated locally by `modal run`):
+    MODAL_GPUS=4 modal run scripts/modal_train.py --action train --steps 1605 \
+        --reader-layers 4 --h-residual full --tag d10_wide640_L4_full
+
+Run order (data is seeded once into the persistent Volume, then reused by every run):
+    modal run scripts/modal_train.py --action seed
+    # residual-free WideReader (the original use; 2x A100):
+    modal run scripts/modal_train.py --action train --steps 1605 --h-residual none --tag d10_wide640_nores
+    # taller V (this experiment; 4 layers, residuals normal, 4x A100):
+    MODAL_GPUS=4 modal run scripts/modal_train.py --action train --steps 20   --reader-layers 4 --tag d10_wide640_L4_pilot
+    MODAL_GPUS=4 modal run scripts/modal_train.py --action train --steps 1605 --reader-layers 4 --tag d10_wide640_L4_full
 
 The image replicates tigerfish: uv sync --extra gpu (torch 2.9.1+cu128, rustbpe from PyPI). The repo
 is baked in at build time so `uv sync` runs; data+tokenizer+checkpoints live on a persistent Volume.
-
-Run order (see also the prep steps the assistant runs around it -- tokenizer upload + volume create):
-    modal run scripts/modal_train.py --action seed
-    modal run scripts/modal_train.py --action train --steps 20   --tag d10_wide_nores_pilot
-    modal run scripts/modal_train.py --action train --steps 1605 --tag d10_wide640_nores
 """
 import os
 import subprocess
@@ -25,6 +35,11 @@ CACHE = "/cache"
 VENV_PY = f"{REPO}/.venv/bin/python"
 VENV_TORCHRUN = f"{REPO}/.venv/bin/torchrun"
 LOCAL_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the 2d-Transformers root
+
+# GPU count, set at launch: `MODAL_GPUS=4 modal run ...`. Read locally when `modal run` imports this
+# file, so the @app.function(gpu=...) spec registered with Modal reflects it. nproc is passed into the
+# remote call (below) from the same value, so torchrun --nproc_per_node always matches the provisioning.
+GPUS = int(os.environ.get("MODAL_GPUS", "2"))
 
 # tigerfish hashes -- the comparability guarantee (data source + tokenizer must be byte-identical)
 SHA1 = {
@@ -51,7 +66,7 @@ image = (
 )
 
 vol = modal.Volume.from_name("nanochat-cache", create_if_missing=True)
-app = modal.App("nanochat-resfree", image=image)
+app = modal.App("nanochat-wide", image=image)
 
 
 def _sha1(path):
@@ -88,19 +103,23 @@ def seed():
     _verify("seed")
 
 
-@app.function(gpu="A100:2", volumes={CACHE: vol}, timeout=4 * 3600)
-def train(steps: int, tag: str, dbs: int = 16):
-    """Residual-free WideReader training on 2x A100-40GB. Refuses to run if hashes don't match."""
+@app.function(gpu=f"A100:{GPUS}", volumes={CACHE: vol}, timeout=6 * 3600)
+def train(steps: int, tag: str, dbs: int = 16, h_residual: str = "full",
+          reader_layers: int = 2, nproc: int = 0):
+    """WideReader training on N x A100-40GB. Refuses to run if the data/tokenizer hashes don't match."""
+    if not nproc:
+        nproc = GPUS
     if not _verify("pre-train"):
         raise RuntimeError("tokenizer/data hash mismatch -- refusing to train (result would not be comparable)")
     common = ("--depth=10 --window-pattern=L --eval-every=100 --eval-tokens=2097152 "
               "--core-metric-every=-1 --sample-every=-1")
-    wide = (f"--reader=wide --reader-dim=640 --h-residual=none "
+    wide = (f"--reader=wide --reader-dim=640 --h-residual={h_residual} --reader-layers={reader_layers} "
             f"--num-iterations={steps} --device-batch-size={dbs}")
-    cmd = (f"{VENV_TORCHRUN} --standalone --nproc_per_node=2 -m scripts.base_train -- "
+    cmd = (f"{VENV_TORCHRUN} --standalone --nproc_per_node={nproc} -m scripts.base_train -- "
            f"{common} {wide} --model-tag={tag}")
     env = dict(os.environ, NANOCHAT_BASE_DIR=CACHE, OMP_NUM_THREADS="1")
-    print(f"=== RUN ({steps} steps, tag={tag}):\n{cmd}\n", flush=True)
+    print(f"=== RUN ({steps} steps, tag={tag}, nproc={nproc}, dbs={dbs}, "
+          f"h_residual={h_residual}, reader_layers={reader_layers}):\n{cmd}\n", flush=True)
     log_path = os.path.join(CACHE, f"{tag}.log")
     with open(log_path, "w") as logf:
         proc = subprocess.Popen(cmd, shell=True, cwd=REPO, env=env,
@@ -117,10 +136,12 @@ def train(steps: int, tag: str, dbs: int = 16):
 
 
 @app.local_entrypoint()
-def main(action: str = "train", steps: int = 1605, tag: str = "d10_wide640_nores", dbs: int = 16):
+def main(action: str = "train", steps: int = 1605, tag: str = "d10_wide640_L4_full",
+         dbs: int = 16, h_residual: str = "full", reader_layers: int = 2):
     if action == "seed":
         seed.remote()
     elif action == "train":
-        train.remote(steps=steps, tag=tag, dbs=dbs)
+        train.remote(steps=steps, tag=tag, dbs=dbs, h_residual=h_residual,
+                     reader_layers=reader_layers, nproc=GPUS)
     else:
         raise SystemExit(f"unknown action: {action!r} (use 'seed' or 'train')")

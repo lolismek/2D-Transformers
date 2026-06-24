@@ -1,11 +1,14 @@
 # nanochat 10+2 — vertical reader: full experiment log
 
 Does a small bidirectional **reader** over the depth axis (the nanochat 10+2 "vertical"
-architecture) beat reading only the top-layer state? Across five experiments — on the parameter,
-rank, FLOP, data, and architecture axes — the answer is no, and this log records why. It runs
-Phase A (baseline vs `d_V=128` reader), the probes asking whether the **128-dim bottleneck** is the
-cause, the `d_V=640` **WideReader** (iso-FLOP and full-budget) that removes the bottleneck, and the
-**residual-free** test that asks whether H's residual stream was making the reader redundant.
+architecture) beat reading only the top-layer state? Across six experiments — on the parameter,
+rank, FLOP, data, architecture, and reader-depth axes — the short answer is *not quite*: with enough
+reader **depth** it reaches **parity** with the top state, but it never clearly beats it and pays
+more to get there. This log records why. It runs Phase A (baseline vs `d_V=128` reader), the probes
+asking whether the **128-dim bottleneck** is the cause, the `d_V=640` **WideReader** (iso-FLOP and
+full-budget) that removes the bottleneck, the **residual-free** test that asks whether H's residual
+stream was making the reader redundant, and the **taller-V** sweep that finds the deficit was a
+reader-*depth* limit.
 
 Related code: `nanochat/readers/vertical.py` (the `d_V=128` reader), `nanochat/readers/wide.py`
 (the full-width `d_V=640` reader), `nanochat/h_variants.py` (`ResidualFreeBlock`),
@@ -206,6 +209,41 @@ the 0.928 here coincidentally equals the old iso-FLOP wide640@756 — unrelated;
 budget.) Plot `experiments/figs/wide640_nores_compare.png` (3 curves, same schedule); data
 `experiments/figs/wide640_nores_val.csv`.
 
+## Taller V — was the reader depth-limited? (`reader_layers=4`)
+
+Width was exonerated (the `d_V=640` WideReader didn't rescue the reader), which left the *other*
+capacity axis untested: reader **depth**. This experiment makes V **taller** — 4 bidirectional blocks
+over the ladder instead of 2 — holding everything else fixed (full width `d_V=640`, residuals normal,
+same 1605-step / 841M-token schedule, so it's equal-data and directly overlay-able on baseline and
+wide@2). Only `--reader-layers` changes (2→4). Run on Modal, 4× A100, via the generalized
+`scripts/modal_train.py`.
+
+| readout (same 1605-step schedule = equal data) | val bpb | Δ vs baseline | Δ vs wide@2 |
+|---|---|---|---|
+| baseline — top-state `h_10` | **0.8770** | — | — |
+| WideReader `d_V=640`, **L=2** | 0.8980 | +0.0210 | — |
+| **WideReader `d_V=640`, L=4** (taller V) | **0.8771** | **+0.0001** | **−0.0209** |
+
+**Result: a taller V closes the entire +0.021 gap and ties baseline.** Going 2→4 reader layers lands
+wide@4 essentially *on* the top-state baseline (Δ +0.0001), so the reader was **depth-capacity-limited,
+not width-limited** — which revises the earlier "capacity exonerated" reading (that was width only).
+The curve is monotone (one transient eval blip at step 400 = 1.44 that recovered next eval). Peak
+memory 23.7 GB at `--dbs 8`; 53.6 min on 4× A100-40GB.
+
+**Open — the result is a *tie*, and ties are ambiguous here.** Two readings fit the exact match:
+- **(A) genuine parity** — 4 layers let V extract a readout from the ladder as good as the top state.
+  Then more depth (`reader_layers=6`) might push *below* baseline = a real win.
+- **(B) collapse to `h_10`** — the extra capacity let V learn to mostly ignore the ladder and
+  reconstruct the top rung; since baseline *is* `h_10`, that also lands exactly on baseline, and
+  depth-reading still buys nothing.
+
+`inspect_reader` on the L4 checkpoint is the cheap first cut (query-pool mass concentrated on rung 10
+⇒ collapse (B); spread over the middle rungs, as the L2 reader did ⇒ genuine (A)) — though the blocks
+mix across rungs *before* the pool, so a rung-ablation at eval is the real clincher. And the cost
+matters: even at parity wide@4 burns ~3.2×/token, so per-FLOP it is still a loss — to be *worth it*
+depth-reading must beat, not tie. Plot `experiments/figs/wide640_layers_compare.png`; data
+`experiments/figs/wide640_L4_val.csv`.
+
 ## Reproduce
 
 ```bash
@@ -229,6 +267,12 @@ python scripts/plot_compute_data.py   # -> experiments/figs/{flops_compare,token
 python -m scripts.check_residual_free
 CUDA_VISIBLE_DEVICES=2,3 NPROC=2 nohup bash scripts/run_wide640_nores.sh > wide640_nores.log 2>&1 &
 python scripts/plot_nores_compare.py  # -> experiments/figs/wide640_nores_compare.png
+
+# taller V (exp 6): reader_layers=4, full budget, on Modal (4x A100); --dbs 8 to fit A100-40GB
+MODAL_GPUS=4 modal run scripts/modal_train.py --action train --steps 1605 \
+    --reader-layers 4 --h-residual full --dbs 8 --tag d10_wide640_L4_full
+python scripts/plot_layers_compare.py  # -> experiments/figs/wide640_layers_compare.png
 ```
 
-Checkpoints (tigerfish): `~/.cache/nanochat/base_checkpoints/d10_{baseline,reader,wide640,wide640_full,baseline_long,wide640_nores}/`.
+Checkpoints (tigerfish): `~/.cache/nanochat/base_checkpoints/d10_{baseline,reader,wide640,wide640_full,baseline_long,wide640_nores}/`;
+exp 6 (`d10_wide640_L4_full`) lives on the Modal `nanochat-cache` volume.

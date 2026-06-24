@@ -21,7 +21,8 @@ baseline is a faithful control. All runs are depth-10 (`d=640`, 10 layers, 5 hea
 A stock nanochat depth-10 backbone **H** produces the 11-rung residual ladder `[x0, h_1, …, h_10]`;
 a small bidirectional **reader V** over those rungs produces the readout — **no `h_10` skip, no gate,
 no identity init**, so V has to *earn* its keep against the top-state baseline. Variations on V's
-width, the compute/data budget, and even H's residual structure are what the experiments below dial.
+width and depth, the compute/data budget, and even H's residual structure are what the experiments
+below dial.
 
 > **Guiding question.** Does reading the whole depth ladder beat reading just the top rung `h_10` —
 > and if not, *why* doesn't it?
@@ -35,6 +36,7 @@ width, the compute/data budget, and even H's residual structure are what the exp
 | 3 | [WideReader `d_V=640` iso-FLOP](#3-widereader-d_v640--iso-flop) | **FLOPs** | does removing the cap rescue it, at equal compute? | base **0.877** vs wide 0.928 (**+0.051**) | no — cap largely exonerated |
 | 4 | [WideReader — full budget](#4-widereader--full-budget-equal-data-vs-equal-compute) | **data + FLOPs** | clean per-token vs per-FLOP read | equal-data **+0.021**; equal-compute **+0.053** | modestly worse/token, clearly worse/FLOP |
 | 5 | [Residual-free WideReader](#5-residual-free-widereader) | **architecture** | do H's residuals "steal V's job"? | base **0.877** vs no-resid 0.928 (**+0.051**) | no — removing them makes V *worse* |
+| 6 | [Taller V — reader depth](#6-taller-v--reader-depth) | **reader depth** | does a *taller* V help where a wider one didn't? | base **0.877** vs wide@4 **0.877** (ties; −0.021 vs wide@2) | yes — closes the gap; genuine-vs-collapse open |
 
 **Detailed writeup with all probes & figures:**
 [`experiments/nanochat_10p2_reader.md`](experiments/nanochat_10p2_reader.md). Per-experiment notes
@@ -94,21 +96,38 @@ thesis held, V should now have a real job. It doesn't: residual-free WideReader 
 cached rungs and can't substitute for the residual stream's *online* accumulation — so a residual-
 free H computes worse rungs *and* V reads worse rungs. → `figs/wide640_nores_compare.png`.
 
+### 6. Taller V — reader depth
+*Axis: reader depth (equal data, 1605 steps).* Width didn't help (exp 3/4), so test the *other*
+capacity axis: make V **taller** — 4 bidirectional blocks over the ladder instead of 2, everything
+else fixed (full width `d_V=640`, residuals normal). It closes the **entire** +0.021 gap: wide@4 =
+**0.877**, landing essentially *on* baseline (Δ +0.0001), −0.021 below wide@2. So the reader was
+**depth-capacity-limited, not width-limited** — a genuine surprise that revises exp 3/4's "capacity
+exonerated" (that was width only). → `figs/wide640_layers_compare.png`.
+
+**Open — not yet resolved.** "Ties baseline" has two readings: **(A)** 4 layers let V extract a
+readout from the ladder as good as the top state (then more depth might *beat* it), or **(B)** the
+extra capacity let V collapse to mimicking `h_10` (and since baseline *is* `h_10`, that also lands on
+baseline — depth-reading still does nothing). The exact match fits either; `inspect_reader` on the L4
+checkpoint (query-pool mass on rung 10 = collapse; spread = genuine) plus a rung-ablation
+disambiguate. And note the cost: even at parity wide@4 burns ~3.2×/token, so to be *worth it*
+depth-reading must beat, not tie — the open `reader_layers=6` run tests that.
+
 ## What we've learned about vertical transformers (so far)
 
-- **The depth ladder is genuinely structured.** V doesn't collapse onto `h_10`; it spreads attention
-  over the middle rungs. There *is* something to read on the depth axis.
-- **But reading it as the readout never beats the top state at d10** — modestly worse per token
-  (+0.021), clearly worse per FLOP (+0.053). And it's neither a width/bottleneck artifact
-  (experiment 3 exonerates the cap) nor fixable by freeing H's residuals (experiment 5 makes it
-  worse).
-- **The unifying mechanism:** nanochat's residual stream means every rung is a partial sum of one
-  telescoping series, so `h_10` already holds the whole sum — re-aggregating the ladder offline is
-  largely redundant. Experiment 5 tested that mechanism head-on and confirmed it (online accumulation
-  is doing the work; an offline reader can't replace it).
-- **Open directions** this points at: more H depth (more, less-redundant rungs to read); V as an
-  *addition* to the top-state path rather than a *replacement*; and online (in-stream) vs offline
-  depth-reading.
+- **The depth ladder is genuinely structured.** With 2 reader blocks V doesn't collapse onto `h_10`;
+  it spreads attention over the middle rungs. There *is* something to read on the depth axis.
+- **Reaching the top state took reader *depth*, not width.** A wider V barely moved (exp 3/4,
+  +0.021); a *taller* V (exp 6, 4 layers) closed the whole gap and **tied** baseline. So V was
+  depth-capacity-limited — but note it *ties*, it has not *beaten* the top state, and at ~3.2×/token
+  it loses per-FLOP. Whether the tie is genuine ladder-reading or V learning to mimic `h_10` is the
+  current open question.
+- **The unifying mechanism (still the best account of the negatives):** nanochat's residual stream
+  makes every rung a partial sum of one telescoping series, so `h_10` already holds the whole sum —
+  re-aggregating the ladder offline is largely redundant. Exp 5 (residual-free) tested it head-on:
+  removing the residuals made V *worse*, confirming the online accumulation does the work.
+- **Open directions:** settle the exp-6 tie (genuine vs collapse) and push reader depth further
+  (`reader_layers=6` — does it *beat* baseline?); more H depth (more, less-redundant rungs to read);
+  V as an *addition* to the top-state path rather than a *replacement*.
 
 ## Repository layout
 
@@ -140,15 +159,15 @@ line. H variants (like residual-free) are gated on `config.h_residual` and live 
 | script | purpose |
 |---|---|
 | `run_phase_a.sh` | exp 1 — d10 baseline vs `d_V=128` reader at full budget |
-| `run_wide640.sh` | exp 3/4 — `d_V=640` WideReader (iso-FLOP 756 steps, or `STEPS=1605` for full budget) |
+| `run_wide640.sh` | exp 3/4/6 — `d_V=640` WideReader (iso-FLOP 756, `STEPS=1605` full budget, `LAYERS=N` reader depth) |
 | `run_baseline_long.sh` | exp 4 — compute-matched baseline (3406 steps) |
 | `run_wide640_nores.sh` | exp 5 — residual-free WideReader (`--h-residual=none`, 1605 steps) |
 | `setup_data.sh` | download data shards + train the tokenizer |
 | `inspect_reader.py` | depth-attention diagnostic (per-rung query-pool weights) |
 | `svd_readout_probe.py` · `frozen_probe.py` | exp 2 — PCA rank probe / trained 128-dim cap on the frozen baseline |
 | `check_reader.py` · `check_reader_dist.py` · `check_wide_reader.py` · `check_residual_free.py` | data-free integration / distributed / shape / residual-free-init checks |
-| `plot_phase_a.py` · `plot_wide_compare.py` · `plot_compute_data.py` · `plot_nores_compare.py` | figures |
-| `modal_train.py` | Modal (serverless GPU) launcher for the residual-free run |
+| `plot_phase_a.py` · `plot_wide_compare.py` · `plot_compute_data.py` · `plot_nores_compare.py` · `plot_layers_compare.py` | figures |
+| `modal_train.py` | Modal (serverless GPU) launcher for WideReader runs — `MODAL_GPUS`, `--h-residual`, `--reader-layers`, `--dbs` (exp 5/6) |
 
 ## Setup & reproduce
 
@@ -161,10 +180,19 @@ CUDA_VISIBLE_DEVICES=2,3 NPROC=2 bash scripts/run_wide640.sh     # exp 3: d_V=64
 CUDA_VISIBLE_DEVICES=2,3 NPROC=2 STEPS=1605 TAG=d10_wide640_full bash scripts/run_wide640.sh   # exp 4
 CUDA_VISIBLE_DEVICES=2,3 NPROC=2 bash scripts/run_baseline_long.sh                              # exp 4
 CUDA_VISIBLE_DEVICES=2,3 NPROC=2 bash scripts/run_wide640_nores.sh                              # exp 5
+CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC=4 LAYERS=4 STEPS=1605 TAG=d10_wide640_L4_full bash scripts/run_wide640.sh  # exp 6
+```
+Experiments 5–6 were run on **Modal** (serverless 2–4× A100) via `scripts/modal_train.py` instead of
+a local box, e.g. exp 6:
+```bash
+MODAL_GPUS=4 modal run scripts/modal_train.py --action train \
+    --steps 1605 --reader-layers 4 --h-residual full --dbs 8 --tag d10_wide640_L4_full
 ```
 Exact flags, the rank/frozen probes, and checkpoint paths are in
 [`experiments/nanochat_10p2_reader.md`](experiments/nanochat_10p2_reader.md). Runs were on 2–4×
-A100-40GB; `--window-pattern=L` (full-context attention) is used because A100 has no FA3 kernel.
+A100-40GB (local or Modal); `--window-pattern=L` (full-context attention) is used because A100 has no
+FA3 kernel. (Modal's bare `A100` pool is 40/80GB-heterogeneous — `reader_layers=4` needs `--dbs 8` to
+fit 40GB; it's grad-accum-compensated, so the result is unchanged.)
 
 ## Credits & license
 
