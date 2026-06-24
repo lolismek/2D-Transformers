@@ -1,13 +1,16 @@
-# nanochat 10+2 — vertical reader: Phase A + readout-bottleneck probes
+# nanochat 10+2 — vertical reader: full experiment log
 
 Does a small bidirectional **reader** over the depth axis (the nanochat 10+2 "vertical"
-architecture) beat reading only the top-layer state, at near-zero added cost? Phase A says no.
-This log records Phase A and the follow-up probes asking whether the reader's **128-dim
-bottleneck** is the cause.
+architecture) beat reading only the top-layer state? Across five experiments — on the parameter,
+rank, FLOP, data, and architecture axes — the answer is no, and this log records why. It runs
+Phase A (baseline vs `d_V=128` reader), the probes asking whether the **128-dim bottleneck** is the
+cause, the `d_V=640` **WideReader** (iso-FLOP and full-budget) that removes the bottleneck, and the
+**residual-free** test that asks whether H's residual stream was making the reader redundant.
 
 Related code: `nanochat/readers/vertical.py` (the `d_V=128` reader), `nanochat/readers/wide.py`
-(the full-width `d_V=640` reader), `scripts/inspect_reader.py` (depth-attention diagnostic),
-`scripts/svd_readout_probe.py` (PCA truncation), `scripts/frozen_probe.py` (trained 128-dim cap).
+(the full-width `d_V=640` reader), `nanochat/h_variants.py` (`ResidualFreeBlock`),
+`scripts/inspect_reader.py` (depth-attention diagnostic), `scripts/svd_readout_probe.py` (PCA
+truncation), `scripts/frozen_probe.py` (trained 128-dim cap).
 
 ## Setup
 
@@ -165,6 +168,44 @@ Figures: `experiments/figs/flops_compare.png` (equal compute, FLOPs axis) and
 `experiments/figs/tokens_compare.png` (equal data, tokens axis). Data:
 `experiments/figs/{wide640_full_val.csv, baseline_long_val.csv}`.
 
+## Residual-free WideReader — does H's residual stream make V redundant? (`nanochat/h_variants.py`)
+
+Every result above lands on the same mechanism: nanochat's residual stream computes
+`x_{i+1} = resid_λ·x_i + x0_λ·x0 + attn_i + mlp_i`, so each rung is a partial sum of one telescoping
+series and the **top state `h_10` already holds the whole sum** `x0 + Σ deltas`. If that's why the
+offline reader keeps losing — it's re-aggregating something `h_10` already has — then **removing the
+residuals should give V a real job.** This experiment tests that thesis directly.
+
+`--h-residual=none` strips H's free additive aggregator so each rung is a *pure deep transform* of
+the previous one, not a partial sum (`ResidualFreeBlock`: `x = attn(norm(x)); x = mlp(norm(x))`, plus
+the x0 injection dropped in the trunk loop). Kept: the learned per-layer gain `resid_lambdas` (it
+scales the signal, it is not a skip), and **V's own residuals** (only H is made residual-free). Two
+init/optimizer fixes are required and were verified data-free (`scripts/check_residual_free.py`):
+with the skips gone, nanochat's zero-init `c_proj` would make the whole trunk emit 0 at init (and
+relu²'(0)=0 kills the gradient), so `c_proj` is initialized at **fan-in scale** instead; and the now-
+unused `x0_lambdas` is **excluded from the optimizer** (else its None grad crashes the distributed
+all-reduce at `world_size>1` — a bug the Modal pilot caught). This is a **single arm** — one
+residual-free WideReader run at the full 1605-step budget (`scripts/run_wide640_nores.sh`), compared
+against the same-schedule, fully-annealed baseline and WideReader (so all three are equal-data,
+per-token). No matched residual-free baseline control was run.
+
+| readout (same 1605-step schedule = equal data) | val bpb | Δ vs baseline | Δ vs WideReader |
+|---|---|---|---|
+| baseline — top-state `h_10` | **0.877** | — | — |
+| WideReader `d_V=640`, H **keeps** residuals | 0.898 | +0.021 | — |
+| **WideReader `d_V=640`, H residual-free** | **0.928** | **+0.051** | **+0.030 (worse)** |
+
+**Verdict: the thesis is wrong — removing H's residuals makes the reader worse, not better.** The
+gap is monotone across the whole back half (every eval checkpoint from step 100), and both wide runs
+are fully annealed, so it's a clean signal, not a slow-start artifact. The interpretation: V is an
+**offline** reader over *cached* rungs and cannot substitute for the residual stream's **online**
+accumulation. Take the residuals away and a residual-free H computes *worse* rungs **and** V reads
+*worse* rungs — strictly worse on both counts. So the residual stream isn't "stealing V's job"; it's
+doing a job (online depth-aggregation) that an offline reader fundamentally can't replace. (Aside:
+the 0.928 here coincidentally equals the old iso-FLOP wide640@756 — unrelated; different token
+budget.) Plot `experiments/figs/wide640_nores_compare.png` (3 curves, same schedule); data
+`experiments/figs/wide640_nores_val.csv`.
+
 ## Reproduce
 
 ```bash
@@ -183,6 +224,11 @@ CUDA_VISIBLE_DEVICES=2,3 NPROC=2 nohup bash scripts/run_wide640.sh > wide640.log
 CUDA_VISIBLE_DEVICES=2,3 NPROC=2 STEPS=1605 TAG=d10_wide640_full nohup bash scripts/run_wide640.sh > wide640_full.log 2>&1 &
 CUDA_VISIBLE_DEVICES=2,3 NPROC=2 nohup bash scripts/run_baseline_long.sh > baseline_long.log 2>&1 &
 python scripts/plot_compute_data.py   # -> experiments/figs/{flops_compare,tokens_compare}.png
+
+# residual-free WideReader (1605 steps): data-free init check first, then the run + plot
+python -m scripts.check_residual_free
+CUDA_VISIBLE_DEVICES=2,3 NPROC=2 nohup bash scripts/run_wide640_nores.sh > wide640_nores.log 2>&1 &
+python scripts/plot_nores_compare.py  # -> experiments/figs/wide640_nores_compare.png
 ```
 
-Checkpoints (tigerfish): `~/.cache/nanochat/base_checkpoints/d10_{baseline,reader,wide640,wide640_full,baseline_long}/`.
+Checkpoints (tigerfish): `~/.cache/nanochat/base_checkpoints/d10_{baseline,reader,wide640,wide640_full,baseline_long,wide640_nores}/`.

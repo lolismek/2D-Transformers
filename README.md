@@ -1,98 +1,166 @@
-# 2D Transformers — a depth-axis "vertical reader"
+# 2D Transformers — experiments on depth-axis ("vertical") reading
 
-Research code for the **vertical reader**: a small bidirectional transformer that reads over the
-**depth (layer) axis** of a language model and *owns the output readout*, instead of predicting from
-only the top layer's hidden state. The question:
+Research code for a running series of experiments on **vertical transformers**: treating the
+**depth (layer) axis** of a language model as a sequence in its own right, and asking what a model
+can learn by *reading across* that axis instead of predicting from only the top layer's hidden state.
 
-> Does reading the whole depth **ladder** `[x0, h_1, …, h_L]` beat reading just the top rung `h_L`,
-> at near-zero added cost?
+This repo is **not** a single thesis with a fixed direction. It's an experiment log. The north star
+is steady — *understand what the depth ladder `[x0, h_1, …, h_L]` carries, and whether reading it
+buys anything* — but each experiment attacks that from whatever angle is sharpest next, and is
+measured on whichever axis the question calls for: sometimes **parameters**, sometimes **FLOPs**,
+sometimes **data**, sometimes **architecture**. Results below are reported as we find them, including
+the (many) negatives.
 
-The repo **vendors [karpathy/nanochat](https://github.com/karpathy/nanochat)** (MIT, commit
-`dc54a1a`) as the transformer backbone and adds a pluggable depth-reader plus the experiments around
-it. nanochat is otherwise unmodified except for **three small, gated edits** (listed below); with
-`--reader=none` the training path is byte-identical to stock nanochat, so the baseline is a faithful
-control.
+The backbone is **[karpathy/nanochat](https://github.com/karpathy/nanochat)** (MIT, commit
+`dc54a1a`), vendored under `nanochat/`. We add a pluggable depth-reader and a few **gated** edits;
+with `--reader=none --h-residual=full` the training path is byte-identical to stock nanochat, so the
+baseline is a faithful control. All runs are depth-10 (`d=640`, 10 layers, 5 heads) unless noted.
 
-## Result — depth-10 backbone (`d=640`, 10 layers, 5 heads)
+## The recurring setup — "10+2"
 
-The **"10+2"** setup: a stock nanochat depth-10 backbone **H** produces the 11-rung residual ladder
-`[x0, h_1, …, h_10]`; a 2-layer bidirectional **reader V** over those rungs produces the readout —
-no `h_10` skip, no gate, no identity init, so V has to *earn* its keep. We test the full-width
-reader (`d_V = 640`, no bottleneck) on two clean axes.
+A stock nanochat depth-10 backbone **H** produces the 11-rung residual ladder `[x0, h_1, …, h_10]`;
+a small bidirectional **reader V** over those rungs produces the readout — **no `h_10` skip, no gate,
+no identity init**, so V has to *earn* its keep against the top-state baseline. Variations on V's
+width, the compute/data budget, and even H's residual structure are what the experiments below dial.
 
-**Equal data** — same 841M tokens, same 1605-step schedule (the *per-token / capability* question):
+> **Guiding question.** Does reading the whole depth ladder beat reading just the top rung `h_10` —
+> and if not, *why* doesn't it?
 
-| readout | val bpb | Δ vs baseline |
-|---|---|---|
-| **baseline** — stock top-state `h_10` | **0.877** | — |
-| reader `d_V=128` (bottlenecked) | 0.933 | +0.056 |
-| **WideReader `d_V=640`** (full width) | 0.898 | **+0.021** |
+## Experiment log
 
-**Equal compute** — same 1.03e18 fwd+bwd FLOPs; the reader costs **2.12×/token**, so for the same
-compute the baseline trains 3406 steps / 2× the tokens (the *per-FLOP / is-it-worth-it* question):
+| # | experiment | axis | question | headline (val bpb) | verdict |
+|---|---|---|---|---|---|
+| 1 | [Phase A — `d_V=128` reader](#1-phase-a--d_v128-reader-vs-baseline) | **params** | does a ~free (+1.1%) depth-reader beat top-state? | base **0.877** vs reader 0.933 (**+0.056**) | no |
+| 2 | [Readout-bottleneck probes](#2-readout-bottleneck-probes-no-retrain) | **rank** | is the 128-dim cap the reason? | PCA-128 +0.454 → trained-128 +0.167 → reader-128 +0.056 | cap is real but doesn't fully explain it |
+| 3 | [WideReader `d_V=640` iso-FLOP](#3-widereader-d_v640--iso-flop) | **FLOPs** | does removing the cap rescue it, at equal compute? | base **0.877** vs wide 0.928 (**+0.051**) | no — cap largely exonerated |
+| 4 | [WideReader — full budget](#4-widereader--full-budget-equal-data-vs-equal-compute) | **data + FLOPs** | clean per-token vs per-FLOP read | equal-data **+0.021**; equal-compute **+0.053** | modestly worse/token, clearly worse/FLOP |
+| 5 | [Residual-free WideReader](#5-residual-free-widereader) | **architecture** | do H's residuals "steal V's job"? | base **0.877** vs no-resid 0.928 (**+0.051**) | no — removing them makes V *worse* |
 
-| readout | val bpb | steps · tokens | Δ vs baseline |
+**Detailed writeup with all probes & figures:**
+[`experiments/nanochat_10p2_reader.md`](experiments/nanochat_10p2_reader.md). Per-experiment notes
+follow.
+
+### 1. Phase A — `d_V=128` reader vs baseline
+*Axis: parameters (equal data, 841M tokens, 1605 steps).* The reader is `d_V=128`, 2 bidirectional
+blocks over the 11 rungs, a learned query-pool, **+558,592 params (+1.14%)**. It loses by **+0.056**
+bpb. But its depth-attention is **non-degenerate** — V almost entirely ignores the top rung
+(`h_10` mass ≈ 0.0003) and reads the middle (rungs 8/6/9). So V *does* read the ladder; it just
+loses while doing so. Leading suspect: the 128-dim `down 640→128 → up 128→640` bottleneck.
+→ `figs/phase_a_val_bpb.png`.
+
+### 2. Readout-bottleneck probes (no retrain)
+*Axis: rank (diagnostics on the frozen baseline checkpoint, no training).* Two probes ask whether
+128 dims is the cause. **PCA truncation** of the baseline's 640-dim readout to 128 costs **+0.454**
+(but participation-ratio is only 5.9 — variance ≠ usefulness, so this is a loose upper bound). A
+**trained 128-dim linear cap** on the frozen top state costs **+0.167** — the floor for a *linear*
+128-cap. The ladder: PCA-128 **+0.454** → trained-linear-128 **+0.167** → reader-128 **+0.056** →
+full-640 **0**. The co-adapted reader already *beats* a frozen linear cap, so it's not simply
+bottleneck-limited — the probe implicates but can't pin the cap. Decisive test → experiment 3.
+
+### 3. WideReader `d_V=640` — iso-FLOP
+*Axis: FLOPs (equal total compute).* Remove the cap entirely: `WideReader` reads at native width
+640, 5 heads / head_dim 128 (= H exactly), no `down`/`up`. It costs **2.122×/token**, so at equal
+total FLOPs it trains 756 steps (~395M tokens, ~47% of baseline's). Result **0.928** = **+0.051** vs
+baseline. Removing the cap closed only ~0.005 of the original 0.056 gap → the **128-dim bottleneck is
+largely exonerated**; depth-reading-as-readout is itself the weaker bet at d10, not the width.
+→ `figs/wide640_isoflop.png`.
+
+### 4. WideReader — full budget (equal data vs equal compute)
+*Axes: data and FLOPs.* The iso-FLOP test starved the reader of tokens, so two full runs separate
+the questions cleanly: the WideReader at the **full 1605-step budget** (same 841M tokens, anneal-
+matched), and a **compute-matched baseline** at 3406 steps (= 1605 × 2.122, equal total FLOPs).
+
+| axis | baseline | WideReader `d_V=640` | Δ |
 |---|---|---|---|
-| **baseline** — top-state `h_10` | **0.845** | 3406 · 1.79B | — |
-| **WideReader `d_V=640`** | 0.898 | 1605 · 841M | **+0.053** |
+| **equal data** — 841M tok, 1605 steps | **0.877** | 0.898 | **+0.021** |
+| **equal compute** — 1.03e18 FLOPs | **0.845** (3406 steps, 1.79B tok) | 0.898 (1605 steps) | **+0.053** |
 
-**Verdict: depth-reading-as-readout does not beat plain top-state reading.** At equal *data* the
-full-width reader is only modestly behind (**+0.021**) — removing the 128-dim bottleneck and training
-to the full budget closed most of the original gap, so the reader's readout is nearly as good per
-token. But it never wins, and at equal *compute* it loses by more (**+0.053**): the reader's 2.12×
-overhead is better spent training the baseline on 2× more tokens, and data scales well here
-(0.877 → 0.845). The depth ladder carries little that the top state `h_10` doesn't already expose.
-Full writeup, probes, and figures:
-[`experiments/nanochat_10p2_reader.md`](experiments/nanochat_10p2_reader.md).
+Per *token* the reader is only modestly behind (**+0.021** — full-budget training pulled it
+0.928 → 0.898, the iso-FLOP number was token-starved). Per *FLOP* it loses by more (**+0.053**): its
+2.12× overhead is better spent on 2× the tokens, and data scales well here (0.877 → 0.845). The
+reader's readout is *nearly* as good per token, but never wins. → `figs/flops_compare.png`,
+`figs/tokens_compare.png`.
 
-![equal-compute: WideReader vs compute-matched baseline](experiments/figs/flops_compare.png)
-![equal-data: WideReader vs baseline at 841M tokens](experiments/figs/tokens_compare.png)
+### 5. Residual-free WideReader
+*Axis: architecture (equal data, 1605 steps).* A different hypothesis: maybe H's **residual
+connections** are a "free additive aggregator" that makes `h_10` already hold the whole sum
+(`h_L = x0 + Σ deltas`), leaving the offline reader V redundant. So remove them — drop both in-block
+skips and the x0 injection, keeping the learned per-layer gain `resid_lambdas` and V's own residuals
+(`--h-residual=none`; needs a fan-in `c_proj` init or the skip-less trunk is dead at init). If the
+thesis held, V should now have a real job. It doesn't: residual-free WideReader is **0.928** —
+**+0.051 vs baseline, +0.030 worse than the WideReader *with* residuals**.
+
+**Removing H's residuals makes the depth-reader worse, not better.** V is an *offline* reader over
+cached rungs and can't substitute for the residual stream's *online* accumulation — so a residual-
+free H computes worse rungs *and* V reads worse rungs. → `figs/wide640_nores_compare.png`.
+
+## What we've learned about vertical transformers (so far)
+
+- **The depth ladder is genuinely structured.** V doesn't collapse onto `h_10`; it spreads attention
+  over the middle rungs. There *is* something to read on the depth axis.
+- **But reading it as the readout never beats the top state at d10** — modestly worse per token
+  (+0.021), clearly worse per FLOP (+0.053). And it's neither a width/bottleneck artifact
+  (experiment 3 exonerates the cap) nor fixable by freeing H's residuals (experiment 5 makes it
+  worse).
+- **The unifying mechanism:** nanochat's residual stream means every rung is a partial sum of one
+  telescoping series, so `h_10` already holds the whole sum — re-aggregating the ladder offline is
+  largely redundant. Experiment 5 tested that mechanism head-on and confirmed it (online accumulation
+  is doing the work; an offline reader can't replace it).
+- **Open directions** this points at: more H depth (more, less-redundant rungs to read); V as an
+  *addition* to the top-state path rather than a *replacement*; and online (in-stream) vs offline
+  depth-reading.
 
 ## Repository layout
 
 | path | owner | what |
 |---|---|---|
 | `nanochat/` | vendored | nanochat backbone (MIT, Karpathy). Upstream docs: [`nanochat/README.md`](nanochat/README.md). |
-| `nanochat/readers/` | **ours** | the depth-reader plugin — `base.py` (interface), `vertical.py` (`d_V=128`), `wide.py` (`d_V=640`), registry in `__init__.py`. |
-| `nanochat/gpt.py`, `nanochat/optim.py` | vendored **+ our edits** | three surgical edits (below). |
-| `scripts/` | mixed | nanochat entrypoints (`base_train.py` **+ our reader CLI**, `base_eval.py`, `tok_*`, `chat_*`) **and** our experiment scripts (below). |
+| `nanochat/readers/` | **ours** | depth-reader plugin — `base.py` (interface), `vertical.py` (`d_V=128`), `wide.py` (`d_V=640`), registry in `__init__.py`. |
+| `nanochat/h_variants.py` | **ours** | H-backbone variants — `ResidualFreeBlock` (experiment 5). |
+| `nanochat/gpt.py`, `nanochat/optim.py` | vendored **+ our edits** | gated edits (below). |
+| `scripts/` | mixed | nanochat entrypoints (`base_train.py` **+ our CLI**, `base_eval.py`, `tok_*`, `chat_*`) **and** our experiment scripts (below). |
 | `experiments/` | **ours** | writeups, figures (`figs/`), and data (CSV/JSON). |
 | `dev/`, `tasks/`, `tests/`, `pyproject.toml`, `uv.lock` | vendored | nanochat. |
 
 The reader is a **plugin into nanochat's reader extension point**: `gpt.py` does
-`from nanochat.readers import build_reader`, so adding an architecture is one module + one registry
-line and needs no other backbone changes.
+`from nanochat.readers import build_reader`, so adding a depth-reader is one module + one registry
+line. H variants (like residual-free) are gated on `config.h_residual` and live in `h_variants.py`.
 
 ### Our edits to nanochat core (all gated — baseline stays stock nanochat)
-- **`nanochat/gpt.py`** (+51 lines): when `config.reader != 'none'`, stash the per-block ladder and
-  let the reader own the readout; otherwise the stock top-state path runs unchanged. Plus reader
-  param-counting and Muon/AdamW optimizer wiring.
-- **`nanochat/optim.py`** (+16 lines): two `world_size > 1` reader-optimizer fixes and a
-  `torch._dynamo` recompile-limit bump for the reader's extra weight shapes.
+- **`nanochat/gpt.py`**: when `config.reader != 'none'`, stash the per-block ladder and let the
+  reader own the readout; when `config.h_residual == 'none'`, build `ResidualFreeBlock`, drop the x0
+  injection, fan-in-init `c_proj`, and exclude `x0_lambdas` from the optimizer. Both default off →
+  the stock top-state path is byte-identical. Plus reader param-counting + Muon/AdamW wiring.
+- **`nanochat/optim.py`**: two `world_size > 1` reader-optimizer fixes and a `torch._dynamo`
+  recompile-limit bump for the reader's extra weight shapes.
 - **`scripts/base_train.py`**: the `--reader / --reader-dim / --reader-layers / --reader-heads /
-  --reader-mlp-mult` CLI, threaded into `GPTConfig`.
+  --reader-mlp-mult` and `--h-residual` CLI, threaded into `GPTConfig`.
 
 ### Our experiment scripts (in `scripts/`)
 | script | purpose |
 |---|---|
-| `run_phase_a.sh` | train d10 baseline vs `d_V=128` reader at the full budget |
-| `run_wide640.sh` | train the `d_V=640` WideReader (iso-FLOP 756 steps, or full 1605-step budget via `STEPS=1605`) |
-| `run_baseline_long.sh` | train the compute-matched baseline (3406 steps) for the equal-compute comparison |
+| `run_phase_a.sh` | exp 1 — d10 baseline vs `d_V=128` reader at full budget |
+| `run_wide640.sh` | exp 3/4 — `d_V=640` WideReader (iso-FLOP 756 steps, or `STEPS=1605` for full budget) |
+| `run_baseline_long.sh` | exp 4 — compute-matched baseline (3406 steps) |
+| `run_wide640_nores.sh` | exp 5 — residual-free WideReader (`--h-residual=none`, 1605 steps) |
 | `setup_data.sh` | download data shards + train the tokenizer |
 | `inspect_reader.py` | depth-attention diagnostic (per-rung query-pool weights) |
-| `svd_readout_probe.py` | PCA-truncation rank probe of the baseline readout |
-| `frozen_probe.py` | trained 128-dim linear cap on the *frozen* baseline readout |
-| `check_reader.py` · `check_reader_dist.py` · `check_wide_reader.py` | data-free integration / distributed / shape checks |
-| `plot_phase_a.py` · `plot_wide_compare.py` · `plot_compute_data.py` | figures |
+| `svd_readout_probe.py` · `frozen_probe.py` | exp 2 — PCA rank probe / trained 128-dim cap on the frozen baseline |
+| `check_reader.py` · `check_reader_dist.py` · `check_wide_reader.py` · `check_residual_free.py` | data-free integration / distributed / shape / residual-free-init checks |
+| `plot_phase_a.py` · `plot_wide_compare.py` · `plot_compute_data.py` · `plot_nores_compare.py` | figures |
+| `modal_train.py` | Modal (serverless GPU) launcher for the residual-free run |
 
 ## Setup & reproduce
 
 Uses nanochat's toolchain (uv + Rust for the tokenizer). On a CUDA box:
 ```bash
 uv sync
-bash scripts/setup_data.sh                              # data shards + tokenizer
-CUDA_VISIBLE_DEVICES=2,3 NPROC=2 bash scripts/run_phase_a.sh   # baseline vs d_V=128 reader
-CUDA_VISIBLE_DEVICES=2,3 NPROC=2 bash scripts/run_wide640.sh   # d_V=640 WideReader, iso-FLOP
+bash scripts/setup_data.sh                                      # data shards + tokenizer
+CUDA_VISIBLE_DEVICES=2,3 NPROC=2 bash scripts/run_phase_a.sh     # exp 1: baseline vs d_V=128 reader
+CUDA_VISIBLE_DEVICES=2,3 NPROC=2 bash scripts/run_wide640.sh     # exp 3: d_V=640 WideReader, iso-FLOP
+CUDA_VISIBLE_DEVICES=2,3 NPROC=2 STEPS=1605 TAG=d10_wide640_full bash scripts/run_wide640.sh   # exp 4
+CUDA_VISIBLE_DEVICES=2,3 NPROC=2 bash scripts/run_baseline_long.sh                              # exp 4
+CUDA_VISIBLE_DEVICES=2,3 NPROC=2 bash scripts/run_wide640_nores.sh                              # exp 5
 ```
 Exact flags, the rank/frozen probes, and checkpoint paths are in
 [`experiments/nanochat_10p2_reader.md`](experiments/nanochat_10p2_reader.md). Runs were on 2–4×

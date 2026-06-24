@@ -1,35 +1,40 @@
 # Experiments
 
-Research log for the depth-axis **vertical reader** on a nanochat depth-10 backbone (the "10+2"
-setup). See the repo [`README.md`](../README.md) for the architecture and the scripts that produced
-these artifacts.
+Research log for **vertical (depth-axis) transformers** on a nanochat depth-10 backbone (the "10+2"
+setup). Open-ended — no fixed thesis; each experiment probes the depth ladder from a different angle
+(params / FLOPs / data / architecture). See the repo [`README.md`](../README.md) for the architecture
+and the scripts that produced these artifacts.
 
 ## Main writeup
-**[`nanochat_10p2_reader.md`](nanochat_10p2_reader.md)** — Phase A (baseline vs `d_V=128` reader),
-the readout-bottleneck probes (PCA truncation + a trained frozen 128-dim linear cap), and the
-decisive `d_V=640` iso-FLOP **WideReader** test.
+**[`nanochat_10p2_reader.md`](nanochat_10p2_reader.md)** — the full log: Phase A (baseline vs
+`d_V=128` reader), the readout-bottleneck probes (PCA truncation + a trained frozen 128-dim linear
+cap), the `d_V=640` **WideReader** (iso-FLOP and full-budget), and the **residual-free** WideReader.
 
-## Headline (val bpb, depth-10)
+## Experiments at a glance (val bpb, depth-10)
 
-Full-width reader (`d_V=640`) tested two ways against the stock top-state baseline:
-
-| comparison | baseline | WideReader `d_V=640` | Δ |
+| # | experiment | axis | result vs baseline 0.877 |
 |---|---|---|---|
-| **equal data** (841M tok, 1605 steps) | **0.877** | 0.898 | +0.021 |
-| **equal compute** (1.03e18 FLOPs) | **0.845** (3406 steps) | 0.898 (1605 steps) | +0.053 |
+| 1 | `d_V=128` reader (Phase A) | params | 0.933 (**+0.056**) |
+| 2 | readout-bottleneck probes (no retrain) | rank | PCA-128 +0.454 → trained-128 +0.167 → reader-128 +0.056 |
+| 3 | WideReader `d_V=640`, iso-FLOP (756 steps) | FLOPs | 0.928 (**+0.051**) |
+| 4 | WideReader `d_V=640`, full budget | data + FLOPs | equal-data +0.021 · equal-compute +0.053 (base 0.845 @3406) |
+| 5 | residual-free WideReader (1605 steps) | architecture | 0.928 (**+0.051**; +0.030 worse than wide *with* residuals) |
 
-Depth-reading-as-readout doesn't beat top-state reading: only modestly worse per *token* (+0.021,
-once trained to the full budget — the earlier 756-step iso-FLOP test was token-starved and overstated
-it), and clearly worse per *FLOP* (+0.053, since the reader's 2.12× overhead is better spent on 2×
-more tokens). The 128-dim bottleneck is exonerated — `h_10` already carries what the ladder offers.
-(The bottlenecked `d_V=128` reader was +0.056 at equal data.)
+**So far:** the ladder is non-degenerate to read (V spreads over the middle rungs, ignores `h_10`),
+but depth-reading-as-readout never beats the top state at d10 — only modestly worse per *token*
+(+0.021 wide) yet clearly worse per *FLOP* (+0.053). It's not a width/bottleneck artifact (exp 3
+exonerates the 128-dim cap; the bottlenecked reader was +0.056) and not fixable by freeing H's
+residuals (exp 5 makes it worse). Mechanism: nanochat's residual stream makes every rung a partial
+sum, so `h_10` already holds what an offline reader would re-aggregate.
 
 ## Artifacts
-- `figs/phase_a_val_bpb.png`, `figs/phase_a_val.csv`, `figs/phase_a_train.csv` — Phase A loss curves
+- `figs/phase_a_val_bpb.png`, `figs/phase_a_val.csv`, `figs/phase_a_train.csv` — exp 1 loss curves
   (baseline vs `d_V=128` reader), produced by `../scripts/plot_phase_a.py`.
-- `figs/wide640_isoflop.png`, `figs/wide640_val.csv` — iso-FLOP 3-way comparison vs cumulative
+- `svd_probe_d10_baseline.json` — exp 2 raw SVD spectrum + bpb(k) curve from the PCA readout probe.
+- `figs/wide640_isoflop.png`, `figs/wide640_val.csv` — exp 3 iso-FLOP 3-way comparison vs cumulative
   compute, produced by `../scripts/plot_wide_compare.py`.
 - `figs/flops_compare.png`, `figs/tokens_compare.png`, `figs/wide640_full_val.csv`,
-  `figs/baseline_long_val.csv` — full-budget WideReader@1605 vs compute-matched baseline@3406 (FLOPs
-  axis) and vs the old baseline@1605 (tokens axis), produced by `../scripts/plot_compute_data.py`.
-- `svd_probe_d10_baseline.json` — raw SVD spectrum + bpb(k) curve from the PCA readout probe.
+  `figs/baseline_long_val.csv` — exp 4 full-budget WideReader@1605 vs compute-matched baseline@3406
+  (FLOPs axis) and vs baseline@1605 (tokens axis), produced by `../scripts/plot_compute_data.py`.
+- `figs/wide640_nores_compare.png`, `figs/wide640_nores_val.csv` — exp 5 residual-free WideReader vs
+  WideReader vs baseline on the same 1605-step schedule, produced by `../scripts/plot_nores_compare.py`.
