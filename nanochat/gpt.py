@@ -49,6 +49,10 @@ class GPTConfig:
     # sum of one telescoping series. Tests whether the residual stream's free additive depth-
     # aggregation is what makes the depth-reader redundant. See nanochat/h_variants.py.
     h_residual: str = "full"
+    # Depth-reader gate: readout = h_L + reader_gate * V(ladder). "none" = the reader owns the readout
+    # (prior behavior). "scalar"/"channel" = additive correction to h_L, gate init ≈0 so g->0 is the
+    # baseline exactly. Only meaningful when reader != "none". See nanochat/readers/base.py combine().
+    reader_gate: str = "none"
 
 
 def norm(x):
@@ -375,7 +379,17 @@ class GPT(nn.Module):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+        # Depth-reader correction: a reader's matrix weights are applied once PER RUNG of the residual
+        # ladder (N = n_layer+1 rungs: [x0, h_1..h_L]), not once per token. The generic 6*(nparams)
+        # term above counts each weight only 6x (once), undercounting the reader matmul by ~(L+1)x and
+        # quietly inflating MFU. Pull every reader param out of the generic term, then add the reader
+        # matrix params back at 6*(L+1). (Reader embedding-like params -- depth_pos, query, gate -- are
+        # not matmuls and are dropped entirely, mirroring how wte/value_embeds are excluded above.)
+        # Matches scripts/check_wide_reader.py:58 and scripts/reader_flops.py.
+        reader_total = sum(p.numel() for p in self.reader.parameters()) if self.reader is not None else 0
+        reader_matrix = sum(w.numel() for w in self.reader.matrix_parameters()) if self.reader is not None else 0
+        num_flops_per_token = 6 * (nparams - nparams_exclude - reader_total) \
+            + 6 * reader_matrix * (self.config.n_layer + 1) + attn_flops
         return num_flops_per_token
 
     def num_scaling_params(self):
@@ -427,7 +441,12 @@ class GPT(nn.Module):
         # MuonAdamW tolerates None grads, which is why check_reader.py missed it). Drop it from the
         # optimizer in reader mode; it stays frozen at init (unused). Baseline (reader=None) unchanged.
         unoptimized_params = []
-        if self.reader is not None:
+        reader_gated = self.reader is not None and getattr(self.config, "reader_gate", "none") != "none"
+        if self.reader is not None and not reader_gated:
+            # Ungated reader owns the readout (combine returns its output), so backout is bypassed and
+            # backout_lambda never gets a grad -- a None grad chokes the distributed all-reduce at
+            # world_size>1. Drop it; it stays frozen at init. Gated readers DO apply backout to `base`,
+            # so backout_lambda keeps a grad and stays in the smear AdamW group below.
             smear_params = [self.smear_gate.weight, self.smear_lambda]
             unoptimized_params = [self.backout_lambda]
         # In residual-free mode (h_residual="none") the x0 injection is removed from forward, so
@@ -437,11 +456,13 @@ class GPT(nn.Module):
         if getattr(self.config, "h_residual", "full") == "none":
             unoptimized_params = unoptimized_params + [self.x0_lambdas]
             x0_params = []
-        # Pluggable reader params: 2D matrices -> Muon (folded into matrix_params), depth-pos/query -> AdamW
+        # Pluggable reader params: 2D matrices -> Muon (folded into matrix_params), depth-pos/query -> AdamW,
+        # additive gate -> its own AdamW group (below).
         reader_matrix_params = self.reader.matrix_parameters() if self.reader is not None else []
         reader_adamw_params = self.reader.adamw_parameters() if self.reader is not None else []
+        reader_gate_params = self.reader.gate_parameters() if self.reader is not None else []
         matrix_params = matrix_params + reader_matrix_params
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(reader_adamw_params) + len(unoptimized_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(reader_adamw_params) + len(reader_gate_params) + len(unoptimized_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -463,6 +484,11 @@ class GPT(nn.Module):
         # AdamW group for the reader's embedding-like params (depth pos embeds + query vector)
         if reader_adamw_params:
             param_groups.append(dict(kind='adamw', params=reader_adamw_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
+        # Dedicated AdamW group for the reader's additive gate. Fixed lr=0.2 (like the smear/backout
+        # scalars), no weight decay so it can rest at/near 0. It always receives a grad in gated mode
+        # (it scales the reader output that feeds the loss), so it is safe under the distributed all-reduce.
+        if reader_gate_params:
+            param_groups.append(dict(kind='adamw', params=reader_gate_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -531,9 +557,16 @@ class GPT(nn.Module):
                 x_backout = x
             if ladder is not None:
                 ladder.append(x)
-        # Readout: the reader (if any) owns it, reading the whole ladder in place of just h_L.
+        # Readout: the reader (if any) reads the whole ladder. Ungated, it owns the readout (combine
+        # returns its output); gated, it adds g*V to the baseline readout `base` (h_L minus the
+        # mid-layer backout), so g=0 reproduces the baseline bit-for-bit. ladder[-1] IS h_L (== the
+        # baseline's running residual x at this point), so `base` here equals the else-branch's x.
         if ladder is not None:
-            x = self.reader.readout(ladder)
+            r = self.reader.readout(ladder)
+            base = ladder[-1]
+            if x_backout is not None and not residual_free:
+                base = base - self.backout_lambda.to(base.dtype) * x_backout
+            x = self.reader.combine(base, r)
         else:
             # Subtract mid-layer residual to remove low-level features before logit projection.
             # Skipped when residual-free: backout assumes the partial-sum structure (x_backout is a

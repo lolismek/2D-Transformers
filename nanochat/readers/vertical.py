@@ -89,6 +89,7 @@ class VerticalReader(BaseReader):
         ])
         self.q = nn.Parameter(torch.zeros(self.dim))                       # query-pool query; real init below
         self.up = Linear(self.dim, self.n_embd, bias=False)               # dV -> 640
+        self._init_gate(config)                                            # additive gate (None unless config.reader_gate set)
         self._last_w = None  # cache of query-pool attention (B,T,N) for diagnostics
 
     @torch.no_grad()
@@ -108,6 +109,8 @@ class VerticalReader(BaseReader):
         # up_proj is NOT zero-initialized: a zero readout would make norm(0) a singular point.
         # A small random readout keeps the model "below baseline, climbing" but non-degenerate.
         torch.nn.init.uniform_(self.up.weight, -s_v, s_v)
+        if self.gate is not None:
+            torch.nn.init.constant_(self.gate, 1e-3)                       # tiny gate: init ≈ baseline, V gets grad from step 0
 
     def readout(self, ladder):
         # ladder: list of (B,T,n_embd), length n_rungs ([x0, h_1..h_L])

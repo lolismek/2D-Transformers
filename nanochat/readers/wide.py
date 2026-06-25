@@ -53,6 +53,7 @@ class WideReader(BaseReader):
             VBlock(self.dim, self.n_heads, self.mlp_mult) for _ in range(config.reader_layers)
         ])
         self.q = nn.Parameter(torch.zeros(self.dim))   # query-pool query; real init below
+        self._init_gate(config)                        # additive gate (None unless config.reader_gate set)
         self._last_w = None  # cache of query-pool attention (B,T,N) for diagnostics
 
     @torch.no_grad()
@@ -67,9 +68,12 @@ class WideReader(BaseReader):
             torch.nn.init.uniform_(blk.c_fc.weight, -s_v * 0.4, s_v * 0.4)
             torch.nn.init.zeros_(blk.mlp_proj.weight)
         torch.nn.init.zeros_(self.q)                   # q=0 -> uniform (mean) pool at init
+        if self.gate is not None:
+            torch.nn.init.constant_(self.gate, 1e-3)   # tiny gate: init ≈ baseline, V gets grad from step 0
         from nanochat.common import print0             # self-document the resolved architecture in the run log
         print0(f"[WideReader] width={self.dim}  n_heads={self.n_heads} (head_dim={self.dim // self.n_heads})  "
-               f"layers={len(self.blocks)}  mlp_mult={self.mlp_mult}  rungs={self.n_rungs}  (no down/up)")
+               f"layers={len(self.blocks)}  mlp_mult={self.mlp_mult}  rungs={self.n_rungs}  "
+               f"gate={'none' if self.gate is None else tuple(self.gate.shape)}  (no down/up)")
 
     def readout(self, ladder):
         # ladder: list of (B,T,n_embd), length n_rungs ([x0, h_1..h_L])

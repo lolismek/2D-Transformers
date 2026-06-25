@@ -67,13 +67,16 @@ one backbone-layer's matmul re-run over all H+1 rungs). Validated vs three repo 
 
 Files: `nanochat/readers/base.py`, `wide.py`, `vertical.py`, `nanochat/gpt.py`, `scripts/base_train.py`.
 
-- **`base.py` (BaseReader):** class attr `gate = None`; `_init_gate(self, config)` reads
-  `config.reader_gate ∈ {none,scalar,channel}` → `None` / `Parameter(zeros(1))` /
-  `Parameter(zeros(n_embd))`; `combine(self, base, r)` → `base if getattr(self,'gate',None) is None
-  else base + self.gate.to(r.dtype)*r`; `gate_parameters()` → `[]` or `[self.gate]`.
+- **`base.py` (BaseReader):** `_init_gate(self, config)` reads `config.reader_gate ∈
+  {none,scalar,channel}` → sets `self.gate` to `None` / `Parameter(zeros(1))` /
+  `Parameter(zeros(n_embd))`; `combine(self, base, r)` → **`r if getattr(self,'gate',None) is None
+  else base + self.gate.to(r.dtype)*r`** (ungated ⇒ reader OWNS the readout, i.e. returns `r`, the
+  prior behavior — NOT `base`); `gate_parameters()` → `[]` or `[self.gate]`. Do **not** declare a
+  class attr `gate = None`: nn.Module's `register_parameter` rejects assigning a Parameter to a name
+  that already exists. All access is `getattr(self,"gate",None)`-guarded.
 - **`wide.py` / `vertical.py`:** call `self._init_gate(config)` in `__init__`; in `init_weights()`
-  add `if self.gate is not None: torch.nn.init.fill_(self.gate, 1e-3)` (mandatory — re-init'd after
-  `to_empty`).
+  add `if self.gate is not None: torch.nn.init.constant_(self.gate, 1e-3)` (mandatory — re-init'd
+  after `to_empty`).
 - **`gpt.py` forward (~535-542):** replace the reader branch with
   ```
   r = self.reader.readout(ladder)

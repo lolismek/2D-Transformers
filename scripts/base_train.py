@@ -59,6 +59,7 @@ parser.add_argument("--reader-layers", type=int, default=2, help="number of bidi
 parser.add_argument("--reader-heads", type=int, default=2, help="reader attention heads (head_dim = reader_dim // reader_heads)")
 parser.add_argument("--reader-mlp-mult", type=int, default=4, help="reader MLP hidden multiplier")
 parser.add_argument("--h-residual", type=str, default="full", choices=["full", "none"], help="H trunk residuals: full=stock nanochat (baseline); none=residual-free (drop attn+mlp skips and the x0 injection)")
+parser.add_argument("--reader-gate", type=str, default="none", choices=["none", "scalar", "channel"], help="additive depth-reader gate: none=reader owns readout; scalar/channel=gated correction to h_L (init ≈0 so g=0 is the baseline)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -146,7 +147,7 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         reader=args.reader, reader_dim=args.reader_dim, reader_layers=args.reader_layers,
         reader_heads=args.reader_heads, reader_mlp_mult=args.reader_mlp_mult,
-        h_residual=args.h_residual,
+        h_residual=args.h_residual, reader_gate=args.reader_gate,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -437,12 +438,19 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        eval_log = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }
+        # If a gated depth-reader is active, log the gate magnitude -- "did V turn on?" becomes observed.
+        reader = getattr(orig_model, "reader", None)
+        if reader is not None and getattr(reader, "gate", None) is not None:
+            gate_mean = reader.gate.detach().float().mean().item()
+            print0(f"Step {step:05d} | reader gate (mean): {gate_mean:.6f}")
+            eval_log["reader/gate"] = gate_mean
+        wandb_run.log(eval_log)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -608,6 +616,36 @@ print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+
+# Per-run results sidecar (consumed by scripts/modal_train.py to build the H×V sweep CSV). One compact
+# JSON per run, written to NANOCHAT_BASE_DIR so it persists on the Modal volume next to the checkpoint.
+if master_process:
+    reader_obj = getattr(orig_model, "reader", None)
+    final_gate = None
+    if reader_obj is not None and getattr(reader_obj, "gate", None) is not None:
+        final_gate = reader_obj.gate.detach().float().mean().item()
+    run_results = {
+        "tag": output_dirname,
+        "depth": args.depth,
+        "n_embd": model_config.n_embd,
+        "reader": args.reader,
+        "reader_layers": args.reader_layers,
+        "reader_gate": args.reader_gate,
+        "num_scaling_params": num_scaling_params,
+        "num_flops_per_token": num_flops_per_token,  # corrected reader accounting (see gpt.estimate_flops)
+        "num_iterations": num_iterations,
+        "total_batch_size": total_batch_size,
+        "total_tokens": total_tokens,
+        "total_flops": num_flops_per_token * total_tokens,
+        "final_val_bpb": val_bpb,
+        "min_val_bpb": min_val_bpb if val_bpb is not None else None,
+        "final_gate": final_gate,
+        "target_param_data_ratio": args.target_param_data_ratio,
+    }
+    results_path = os.path.join(base_dir, f"{output_dirname}.result.json")
+    with open(results_path, "w") as f:
+        json.dump(run_results, f, indent=2)
+    print0(f"Wrote run results sidecar to {results_path}")
 
 # Log to report
 from nanochat.report import get_report
