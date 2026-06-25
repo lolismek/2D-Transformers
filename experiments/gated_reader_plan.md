@@ -42,7 +42,7 @@ one backbone-layer's matmul re-run over all H+1 rungs). Validated vs three repo 
 | run | reader_matrix | fpt × base | tokens | total FLOPs | dbs | time |
 |---|---|---|---|---|---|---|
 | d10 × L2 | 9.83M | 2.12× | 0.96e9 | 1.18e18 | 16 | 0.7 h |
-| d10 × L4 | 19.66M | 3.24× | 1.08e9 | 2.02e18 | 16 | 1.1 h |
+| d10 × L4 | 19.66M | 3.24× | 1.08e9 | 2.02e18 | 8 | 1.4 h |
 | d10 × L8 | 39.32M | 5.49× | 1.31e9 | 4.16e18 | 8 | 2.3 h |
 | d10 × L10 | 49.15M | 6.61× | 1.43e9 | 5.46e18 | 8 | 3.1 h |
 

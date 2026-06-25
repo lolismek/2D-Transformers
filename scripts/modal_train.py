@@ -211,8 +211,8 @@ def ablate(tag: str, step: int = 0, dbs: int = 16, eval_tokens: int = 2097152):
 # The d10 V-slope run set (see experiments/gated_reader_plan.md): four gated WideReader cells at d10
 # (dbs drops to 8 for the two tall readers to fit 40GB) + three plain baselines that bracket them on
 # the FLOPs axis. d10=0.877 is reused from tigerfish (not retrained here; pass --with-d10 to add it).
-SWEEP_READERS = [  # (reader_layers, device_batch_size)
-    (2, 16), (4, 16), (8, 8), (10, 8),
+SWEEP_READERS = [  # (reader_layers, device_batch_size); L4+ drop to dbs=8 to fit 40GB A100s
+    (2, 16), (4, 8), (8, 8), (10, 8),
 ]
 SWEEP_BASELINES = [12, 14, 16]  # depth; dbs 16
 
