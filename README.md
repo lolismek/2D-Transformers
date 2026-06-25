@@ -128,6 +128,15 @@ depth-reading must beat, not tie — the open `reader_layers=6` run tests that.
 - **Open directions:** settle the exp-6 tie (genuine vs collapse) and push reader depth further
   (`reader_layers=6` — does it *beat* baseline?); more H depth (more, less-redundant rungs to read);
   V as an *addition* to the top-state path rather than a *replacement*.
+- **MLM on the ladder (idea, not run).** Attacks the redundancy mechanism head-on. *Bidirectional H*
+  (BERT-style masked-token objective) would make the top layer task-specialized and *shed* info that
+  middle rungs keep (the classic "best layer is in the middle"), so for the first time the ladder is
+  non-redundant and V has a real job — could *beat* the top state, not just tie. Caveats: drops bpb-
+  comparability + the generative stack, and is partly circular (the objective, not V, removes the
+  redundancy). **Pre-test cheaply first:** per-layer probe (`frozen_probe.py`) on a bidirectional H —
+  do middle rungs beat the top? If not, MLM buys V nothing. Note the *mask-a-rung* variant (denoise a
+  dropped rung from its neighbors) is a dead end: the residual stream makes it near-trivial (copy the
+  neighbor) and only reinforces the redundancy we're fighting.
 
 ## Repository layout
 

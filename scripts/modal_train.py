@@ -135,13 +135,41 @@ def train(steps: int, tag: str, dbs: int = 16, h_residual: str = "full",
     return tag
 
 
+@app.function(gpu="A100", volumes={CACHE: vol}, timeout=2 * 3600)
+def ablate(tag: str, step: int = 0, dbs: int = 16, eval_tokens: int = 2097152):
+    """Top-rung ablation probe on a trained reader checkpoint (single A100, eval only).
+
+    Replaces every rung of the ladder with the top rung h_L and re-measures val bpb: unchanged
+    => the reader collapsed to h_L (effective identity); worse => it genuinely reads the ladder.
+    Eval is a no_grad single forward, so 1 GPU (even a 40GB card) is ample.
+    """
+    if not _verify("pre-ablate"):
+        raise RuntimeError("tokenizer/data hash mismatch -- refusing (eval would not be comparable)")
+    step_arg = f" --step {step}" if step else ""
+    cmd = (f"{VENV_PY} -m scripts.ablate_reader --model-tag {tag}{step_arg} "
+           f"--device-batch-size {dbs} --eval-tokens {eval_tokens}")
+    env = dict(os.environ, NANOCHAT_BASE_DIR=CACHE, OMP_NUM_THREADS="1")
+    print(f"=== ABLATE (tag={tag}, dbs={dbs}, eval_tokens={eval_tokens}):\n{cmd}\n", flush=True)
+    proc = subprocess.Popen(cmd, shell=True, cwd=REPO, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    rc = proc.wait()
+    print(f"=== DONE rc={rc}", flush=True)
+    if rc != 0:
+        raise RuntimeError(f"ablate exited with code {rc}")
+
+
 @app.local_entrypoint()
 def main(action: str = "train", steps: int = 1605, tag: str = "d10_wide640_L4_full",
-         dbs: int = 16, h_residual: str = "full", reader_layers: int = 2):
+         dbs: int = 16, h_residual: str = "full", reader_layers: int = 2,
+         step: int = 0, eval_tokens: int = 2097152):
     if action == "seed":
         seed.remote()
     elif action == "train":
         train.remote(steps=steps, tag=tag, dbs=dbs, h_residual=h_residual,
                      reader_layers=reader_layers, nproc=GPUS)
+    elif action == "ablate":
+        ablate.remote(tag=tag, step=step, dbs=dbs, eval_tokens=eval_tokens)
     else:
-        raise SystemExit(f"unknown action: {action!r} (use 'seed' or 'train')")
+        raise SystemExit(f"unknown action: {action!r} (use 'seed', 'train', or 'ablate')")
