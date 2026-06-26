@@ -64,6 +64,14 @@ def _append_csv(row):
         w.writerow(row)
     print(f"appended {row.get('tag')} (val_bpb={row.get('final_val_bpb')}) -> {SWEEP_CSV}", flush=True)
 
+
+def _done_tags():
+    """Tags already in the sweep CSV -- a relaunch skips them so the sweep resumes after a crash/OOM."""
+    if not os.path.exists(SWEEP_CSV):
+        return set()
+    with open(SWEEP_CSV, newline="") as f:
+        return {r["tag"] for r in csv.DictReader(f) if r.get("tag")}
+
 # GPU count, set at launch: `MODAL_GPUS=4 modal run ...`. Read locally when `modal run` imports this
 # file, so the @app.function(gpu=...) spec registered with Modal reflects it. nproc is passed into the
 # remote call (below) from the same value, so torchrun --nproc_per_node always matches the provisioning.
@@ -159,7 +167,8 @@ def train(steps: int, tag: str, depth: int = 10, reader: str = "wide", reader_la
                 f"--h-residual={h_residual} --device-batch-size={dbs}")
     cmd = (f"{VENV_TORCHRUN} --standalone --nproc_per_node={nproc} -m scripts.base_train -- "
            f"{common} {arch} {horizon} --model-tag={tag}")
-    env = dict(os.environ, NANOCHAT_BASE_DIR=CACHE, OMP_NUM_THREADS="1")
+    env = dict(os.environ, NANOCHAT_BASE_DIR=CACHE, OMP_NUM_THREADS="1",
+               PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")  # reclaim fragmentation (tall readers OOM at the margin)
     print(f"=== RUN tag={tag} depth={depth} reader={reader} layers={reader_layers} gate={reader_gate} "
           f"nproc={nproc} dbs={dbs} horizon='{horizon}':\n{cmd}\n", flush=True)
     log_path = os.path.join(CACHE, f"{tag}.log")
@@ -211,8 +220,8 @@ def ablate(tag: str, step: int = 0, dbs: int = 16, eval_tokens: int = 2097152):
 # The d10 V-slope run set (see experiments/gated_reader_plan.md): four gated WideReader cells at d10
 # (dbs drops to 8 for the two tall readers to fit 40GB) + three plain baselines that bracket them on
 # the FLOPs axis. d10=0.877 is reused from tigerfish (not retrained here; pass --with-d10 to add it).
-SWEEP_READERS = [  # (reader_layers, device_batch_size); L4+ drop to dbs=8 to fit 40GB A100s
-    (2, 16), (4, 8), (8, 8), (10, 8),
+SWEEP_READERS = [  # (reader_layers, device_batch_size); dbs shrinks with reader depth to fit 40GB A100s
+    (2, 16), (4, 8), (8, 4), (10, 4),  # L8/L10 OOM'd at dbs=8 -> dbs=4 (effective batch unchanged: just more grad-accum)
 ]
 SWEEP_BASELINES = [12, 14, 16]  # depth; dbs 16
 
@@ -239,6 +248,12 @@ def main(action: str = "train", steps: int = 0, tag: str = "hv_pilot",
                            reader_gate=reader_gate, dbs=dbs, h_residual=h_residual,
                            target_param_data_ratio=r, nproc=GPUS)
         _append_csv(row)
+    elif action == "spawn":  # fire-and-forget one run; under --detach it survives the client exiting (laptop close)
+        r = _ratio(reader, depth, reader_layers, target_param_data_ratio)
+        call = train.spawn(steps=steps, tag=tag, depth=depth, reader=reader, reader_layers=reader_layers,
+                           reader_gate=reader_gate, dbs=dbs, h_residual=h_residual,
+                           target_param_data_ratio=r, nproc=GPUS)
+        print(f"=== SPAWNED {tag} call_id={call.object_id} -> result lands at volume:{tag}.result.json ===", flush=True)
     elif action == "sweep":
         runs = []  # build the full plan, then run sequentially
         if with_d10:
@@ -250,12 +265,21 @@ def main(action: str = "train", steps: int = 0, tag: str = "hv_pilot",
         for H in SWEEP_BASELINES:
             runs.append(dict(tag=f"hv_d{H}_base", depth=H, reader="none", reader_layers=2,
                              reader_gate="none", dbs=16, target_param_data_ratio=12.0))
-        print(f"=== SWEEP: {len(runs)} runs (sequential on {GPUS}xA100) ===")
-        for i, rc in enumerate(runs):
-            print(f"--- [{i+1}/{len(runs)}] {rc['tag']} ---", flush=True)
-            row = train.remote(steps=steps, h_residual=h_residual, nproc=GPUS, **rc)
-            _append_csv(row)
-        print(f"=== SWEEP done -> {SWEEP_CSV} ===")
+        done = _done_tags()  # resume: skip runs already recorded (idempotent relaunch after a crash/OOM)
+        pending = [rc for rc in runs if rc["tag"] not in done]
+        if done:
+            print(f"=== resume: skipping {len(done)} done {sorted(done)} ===", flush=True)
+        print(f"=== SWEEP: {len(pending)}/{len(runs)} runs to do (sequential on {GPUS}xA100) ===")
+        failed = []
+        for i, rc in enumerate(pending):
+            print(f"--- [{i+1}/{len(pending)}] {rc['tag']} ---", flush=True)
+            try:  # one run's failure (OOM, transient blip) must not kill the rest of the sweep
+                row = train.remote(steps=steps, h_residual=h_residual, nproc=GPUS, **rc)
+                _append_csv(row)
+            except Exception as e:
+                failed.append(rc["tag"])
+                print(f"!!! RUN FAILED {rc['tag']}: {type(e).__name__}: {e}", flush=True)
+        print(f"=== SWEEP done -> {SWEEP_CSV}  (failed: {failed or 'none'}) ===")
     elif action == "ablate":
         ablate.remote(tag=tag, step=step, dbs=dbs, eval_tokens=eval_tokens)
     else:
